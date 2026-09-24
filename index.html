@@ -680,9 +680,10 @@ function renderTabs(){
     ['screws','Screws'],
     ['consumables','Thinners & Stopping'],
     ['people','People'],
-    ['reports','Reports & Export'],
     ['suppliers','Suppliers'],
   ];
+  // "View reports" permission was being ignored — the tab showed for everyone.
+  if(can('consViewReports') || can('consExportExcel')) items.splice(3, 0, ['reports','Reports & Export']);
   if(can('consSendToDispatch')) items.push(['dispatch','Send to Dispatch']);
   if(State.currentUser.isRoot || can('manageUsers')) items.push(['admin','Admin']);
   items.forEach(([key,label])=>{
@@ -1429,6 +1430,7 @@ function renderReportsTab(){
   container.appendChild(card);
 
   // Live low-stock summary, useful alongside reports
+  if(!can('consViewReports')) return container;
   const stockCard = el('div','card');
   stockCard.innerHTML = `<h2>Items at or below reorder level</h2>`;
   const lowScrews = Object.values(State.screwItems||{}).filter(i=> totalScrewQty(i) <= i.reorderQty);
@@ -1653,16 +1655,20 @@ async function submitSendToDispatch(){
   }
 
   try{
-    const snap = await State.dispatchBoardRef.child('items').once('value');
-    const items = Array.isArray(snap.val()) ? snap.val() : [];
+    // Atomic append (transaction) — a plain read-then-overwrite could
+    // wipe out a Dispatch change someone else saved in the same moment.
     const today = new Date().toLocaleDateString('en-GB', {day:'2-digit', month:'long', year:'numeric'});
-    items.push({
+    const newItem = {
       id: uid(), type: label + (kind==='liquid' ? ' (' + qty + 'ml)' : ''), qty, ref,
       status: 'unvinaged',
       addedDate: today, vinagedDate: null, readyDate: null, dispatchedDate: null, noteId: null,
       recipeSnapshot: [{ sourceApp: 'consumablesStock', kind, itemId, desc: label, deductQty: qty, location }]
+    };
+    await State.dispatchBoardRef.child('items').transaction(current => {
+      const items = Array.isArray(current) ? current : (current && typeof current === 'object' ? Object.values(current) : []);
+      items.push(newItem);
+      return items;
     });
-    await State.dispatchBoardRef.child('items').set(items);
     toast(`Sent ${qty}${kind==='liquid'?'ml':''} of ${label} to Dispatch.`, 'ok');
     document.getElementById('sd-qty').value = '1';
     document.getElementById('sd-ref').value = '';
@@ -2022,7 +2028,9 @@ function openEditUserModal(id){
     u.username = username;
     if(pin) u.pin = await hashPin(pin);
     u.consEmailSignature = signature;
-    u.permissions = newPerms;
+    // Merge, don't replace — replacing wiped this person's permissions in
+    // the other three apps (Dispatch, Stock List, Board Stock).
+    u.permissions = { ...(u.permissions || {}), ...newPerms };
     u.isRoot = isMainRoot(u) ? true : (isRootBox ? isRootBox.checked : u.isRoot);
     u.apps = isMainRoot(u) ? defaultApps() : readAppAccessChecklist('eu', iAmMainRoot, apps);
     await saveSharedUsers();
