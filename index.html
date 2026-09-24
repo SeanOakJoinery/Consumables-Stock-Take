@@ -114,9 +114,10 @@
   Database and paste the config into FIREBASE_CONFIG below (see SETUP.md), same as board-stock-app.
 -->
 
-<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-storage-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-storage-compat.js"></script>
+<script src="https://seanoakjoinery.github.io/oak-core/oak-core.js?v=1"></script>
 <script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 
@@ -279,7 +280,7 @@ const CONFIG = {
    ========================================================================= */
 const State = {
   db: null,
-  dispatchBoardRef: null,   // shared 'dispatchBoard' node — users only
+  dispatchBoardRef: null,   // still used for dispatchBoard/items (stock→dispatch handoff); users via OakCore
   sharedUsers: [],          // synced live from dispatchBoard/users
   currentUser: null, // an entry from sharedUsers: {id, username, pin, isRoot, isMainRoot, apps, permissions}
   screwItems: {},
@@ -347,11 +348,18 @@ function toast(msg, type){
 /* =========================================================================
    FIREBASE INIT + SYNC
    ========================================================================= */
+let oak = null;
 function initFirebase(){
   try{
     if(!firebase.apps.length) firebase.initializeApp(CONFIG.FIREBASE_CONFIG);
     State.db = firebase.database();
+    // Still used for dispatchBoard/items (stock→dispatch handoff).
+    // Shared users sync/save now goes through OakCore (see SHARED AUTH).
     State.dispatchBoardRef = firebase.database().ref('dispatchBoard');
+    if (window.OakCore) {
+      oak = OakCore.createApp({ appId: "consumables", readOnly: false });
+      oak.init();
+    }
   }catch(e){
     toast('Firebase init failed: ' + e.message, 'err');
     return;
@@ -406,10 +414,9 @@ function onDataChange(){
 }
 
 /* =========================================================================
+   Oak Core cutover 2026-09-24: users sync/save + hashPin via https://seanoakjoinery.github.io/oak-core/oak-core.js?v=1 — rollback branch backup-before-oak-core-2026-09-24
    SHARED AUTH — same users[]/permissions system as the Dispatch, Stock
-   List, and Board Stock apps (per user request: "use the same api and
-   bin as the other apps and the same app permissions"). Login/user
-   management lives on the shared 'dispatchBoard/users' path; this app's
+   List, and Board Stock apps. Login/user-management via OakCore; this app's
    OWN data (screws, consumables, people, transactions, suppliers) stays
    at CONFIG.DB_PATH, untouched by any of this.
    ========================================================================= */
@@ -426,19 +433,16 @@ function userHasApp(u, appId){
   if(!u.apps) return true; // legacy account — not yet scoped
   return !!u.apps[appId];
 }
-async function hashPin(pin){
-  const enc = new TextEncoder().encode(pin);
-  const buf = await crypto.subtle.digest('SHA-256', enc);
-  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
-}
+async function hashPin(pin){ return OakCore.hashPin(pin); }
+// Writes State.sharedUsers via OakCore (shared dispatchBoard/users path).
 async function saveSharedUsers(){
-  if(!State.dispatchBoardRef) return;
-  try{ await State.dispatchBoardRef.child('users').set(State.sharedUsers); }catch(e){ toast('Could not save users: ' + e.message, 'err'); }
+  if(!oak) return;
+  try{ await oak.saveUsers(State.sharedUsers); }catch(e){ toast('Could not save users: ' + e.message, 'err'); }
 }
 function startSharedUsersSync(){
-  if(!State.dispatchBoardRef) return;
-  State.dispatchBoardRef.child('users').on('value', snap => {
-    State.sharedUsers = Array.isArray(snap.val()) ? snap.val() : [];
+  if(!oak) return;
+  oak.startUsersSync((list) => {
+    State.sharedUsers = Array.isArray(list) ? list : [];
     onDataChange();
   });
 }
@@ -640,7 +644,7 @@ function renderLogin(){
   }
   box.innerHTML = `
     <h1>Fixings &amp; Finishing Stock</h1>
-    <div class="sub">Oak Joinery — sign in</div>
+    <div class="sub">Oak Joinery — sign in${window.OakCore && OakCore.VERSION ? (" · oak-core " + OakCore.VERSION) : ""}</div>
     <label>Username</label>
     <input type="text" id="li-user" autocomplete="username">
     <label>PIN</label>
