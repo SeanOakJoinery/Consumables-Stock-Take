@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
 <title>Fixings &amp; Finishing Stock</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="icon-192.png" type="image/png">
 <link rel="apple-touch-icon" href="icon-180.png">
@@ -481,11 +483,14 @@ function currentUserIsRoot(){ return !!(State.currentUser && State.currentUser.i
 let reorderQueue = {}; // supplierId (or '__none') -> [{itemLabel, currentQty, reorderQty}]
 let reorderFlushTimer = null;
 
+// Email sending moved server-side (weekly digest via GitHub Actions,
+// see dev notes) — this app no longer sends reorder emails itself the
+// instant something crosses its threshold. reorderSent is kept only as
+// harmless historical bookkeeping; nothing reads it anymore.
 function checkReorder(kind, id, label, currentQty, reorderQty, currentlySent, supplierId, isVolume){
   const belowThreshold = currentQty <= reorderQty;
   const path = kind === 'screw' ? 'screwItems' : 'consumableTypes';
   if(belowThreshold && !currentlySent){
-    enqueueReorder(supplierId, label, currentQty, reorderQty, isVolume);
     dbRef(path + '/' + id + '/reorderSent').set(true);
   } else if(!belowThreshold && currentlySent){
     dbRef(path + '/' + id + '/reorderSent').set(false);
@@ -520,18 +525,20 @@ function sendSupplierReorderEmail(supplierId, items){
     toast('Reorder needed (' + supplierName + ') — email not sent, check EmailJS/supplier email setup', 'err');
     return;
   }
-  const lines = items.map(i=> i.isVolume
-    ? `${i.itemLabel}: ${mlToLabel(i.currentQty)} on hand (reorder at ${mlToLabel(i.reorderQty)})`
-    : `${i.itemLabel}: ${i.currentQty} on hand (reorder at ${i.reorderQty})`
+  const lines = items.map((i,idx)=> i.isVolume
+    ? `${idx+1}. ${i.itemLabel}: ${mlToLabel(i.currentQty)} on hand (reorder at ${mlToLabel(i.reorderQty)})`
+    : `${idx+1}. ${i.itemLabel}: ${i.currentQty} on hand (reorder at ${i.reorderQty})`
   ).join('\n');
   const greeting = 'Good day' + (contactName ? ' ' + contactName : '') + ',';
-  const signature = (State.currentUser && (State.currentUser.consEmailSignature || State.currentUser.username)) || '';
-  const signOff = signature ? `\n\nKind regards,\n${signature}` : '';
-  const message = `${greeting}\n\nI hope this email finds you well.\n\nPlease quote me on the following:\n\n${lines}${signOff}`;
+  // Numbered list + ending at "Kind regards," (no name) to match the
+  // signature card the user pasted directly into the EmailJS template
+  // itself — that's fixed HTML in the template now, not text this app
+  // builds, so it shows up the same regardless of who triggered the send.
+  const message = `${greeting}\n\nI hope this email finds you well.\n\nPlease quote me on the following:\n\n${lines}\n\nKind regards,`;
   emailjs.send(CONFIG.EMAILJS_SERVICE_ID, CONFIG.EMAILJS_TEMPLATE_ID, {
     to_email: toEmail,
     cc_email: ccEmail,
-    from_name: signature,
+    from_name: (State.currentUser && State.currentUser.username) || 'Oak Joinery',
     item_name: supplierName + ' — ' + items.length + ' item(s)',
     current_qty: '',
     reorder_qty: '',
@@ -1362,6 +1369,22 @@ function renderPeopleTab(){
 /* ---------- Reports / Export Tab ---------- */
 function renderReportsTab(){
   const container = el('div','');
+
+  const pdfCard = el('div','card');
+  pdfCard.style.marginBottom = '18px';
+  pdfCard.innerHTML = `<h2>Stock Report</h2><div class="sub">A snapshot of current screw and consumable stock levels, any time — handy to print or hand to someone.</div>`;
+  if(can('consExportExcel')){
+    const row = el('div','btn-row');
+    const pdfBtn = document.createElement('button');
+    pdfBtn.className = 'btn btn-amber';
+    pdfBtn.id = 'share-stock-pdf-btn';
+    pdfBtn.textContent = 'Print / Share PDF';
+    pdfBtn.onclick = generateAndShareStockPdf;
+    row.appendChild(pdfBtn);
+    pdfCard.appendChild(row);
+  }
+  container.appendChild(pdfCard);
+
   const card = el('div','card');
   card.innerHTML = `<h2>Export to Excel</h2><div class="sub">Export handout history for one person, or everyone, for a given month.</div>`;
 
@@ -1428,6 +1451,89 @@ function renderReportsTab(){
   container.appendChild(stockCard);
 
   return container;
+}
+
+/* Stock report PDF (added 2026-09-23, per user request: "is it setup to
+   pull stock levels...to hand in to my superiors" — mirrors Stock List's
+   own Print/Share PDF). Two tables: screws, then consumable types
+   (liquid volumes and container counts both shown in their own units). */
+function buildStockPdfBlob(){
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF();
+  const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
+
+  doc.setFontSize(16);
+  doc.setFont(undefined, 'bold');
+  doc.text('Fixings & Finishing Stock Report', 14, 18);
+  doc.setFontSize(9);
+  doc.setFont(undefined, 'normal');
+  doc.text('Generated ' + new Date().toLocaleString(), 14, 24);
+
+  let y = 32;
+  const screws = Object.values(State.screwItems || {}).sort((a,b)=> a.size.localeCompare(b.size, undefined, {numeric:true}));
+  if(screws.length > 0){
+    const rows = screws.map(item => {
+      const breakdown = locations.map(l => `${l}: ${screwQtyAt(item,l)}`).join('  ·  ');
+      return [item.size, item.bundleSize, breakdown, totalScrewQty(item), item.reorderQty];
+    });
+    doc.autoTable({
+      startY: y,
+      head: [['Screws', 'Bundle size', 'By location', 'Total (bundles)', 'Reorder at']],
+      body: rows,
+      styles: { fontSize: 8, cellPadding: 2 },
+      headStyles: { fillColor: [184, 121, 31] },
+      margin: { left: 14, right: 14 },
+    });
+    y = doc.lastAutoTable.finalY + 8;
+  }
+
+  const types = Object.entries(State.consumableTypes || {}).sort((a,b)=> a[1].name.localeCompare(b[1].name));
+  if(types.length > 0){
+    const rows = types.map(([tid, type]) => {
+      if(type.category === 'liquid'){
+        const breakdown = locations.map(l => `${l}: ${mlToLabel(volumeAt(type,l))}`).join('  ·  ');
+        return [type.name + ' (Liquid)', breakdown, mlToLabel(totalVolumeMl(type)), mlToLabel(type.reorderLevelMl||0)];
+      }
+      const active = Object.values(State.consumableUnits||{}).filter(u=>u.typeId===tid && u.fillLevel!=='Finished').length;
+      return [type.name, '—', active + ' container(s)', (type.reorderQty||0) + ' container(s)'];
+    });
+    if(y > 250){ doc.addPage(); y = 20; }
+    doc.autoTable({
+      startY: y,
+      head: [['Consumable', 'By location', 'Total on hand', 'Reorder at']],
+      body: rows,
+      styles: { fontSize: 8, cellPadding: 2 },
+      headStyles: { fillColor: [184, 121, 31] },
+      margin: { left: 14, right: 14 },
+    });
+  }
+
+  return doc.output('blob');
+}
+async function generateAndShareStockPdf(){
+  if(!can('consExportExcel')) return;
+  const btn = document.getElementById('share-stock-pdf-btn');
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Preparing PDF…';
+  try{
+    const blob = buildStockPdfBlob();
+    const file = new File([blob], 'consumables-stock-report.pdf', { type: 'application/pdf' });
+    if(navigator.canShare && navigator.canShare({ files: [file] })){
+      await navigator.share({ files: [file], title: 'Consumables Stock Report', text: 'Consumables stock report — ' + new Date().toLocaleDateString() });
+    } else {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'consumables-stock-report.pdf';
+      document.body.appendChild(a); a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+  } catch(e){
+    if(e.name !== 'AbortError') toast('Could not generate the PDF.', 'err');
+  }
+  btn.disabled = false;
+  btn.textContent = original;
 }
 
 function exportToExcel(personSel, monthSel){
@@ -1629,13 +1735,15 @@ function openAddSupplierModal(){
     <input type="text" id="m-email">
     <label>CC email (optional)</label>
     <input type="text" id="m-cc">
+    <label style="display:flex;align-items:center;gap:7px;font-weight:400;margin-top:10px;"><input type="checkbox" id="m-direct" style="width:auto;"> Send the weekly digest straight to this supplier (skip reviewing it yourself first)</label>
   `, ()=>{
     const name = document.getElementById('m-name').value.trim();
     const contactPerson = document.getElementById('m-contact').value.trim();
     const email = document.getElementById('m-email').value.trim();
     const ccEmail = document.getElementById('m-cc').value.trim();
+    const sendDirect = document.getElementById('m-direct').checked;
     if(!name){ toast('Enter a supplier name', 'err'); return false; }
-    dbRef('suppliers/' + uid()).set({ name, contactPerson, email, ccEmail });
+    dbRef('suppliers/' + uid()).set({ name, contactPerson, email, ccEmail, sendDirect });
     return true;
   });
 }
@@ -1651,14 +1759,16 @@ function openEditSupplierModal(sid){
     <input type="text" id="m-email" value="${escapeHtml(s.email||'')}">
     <label>CC email (optional)</label>
     <input type="text" id="m-cc" value="${escapeHtml(s.ccEmail||'')}">
+    <label style="display:flex;align-items:center;gap:7px;font-weight:400;margin-top:10px;"><input type="checkbox" id="m-direct" style="width:auto;" ${s.sendDirect?'checked':''}> Send the weekly digest straight to this supplier (skip reviewing it yourself first)</label>
     <div class="btn-row"><button class="btn btn-danger" id="m-delete" type="button">Delete this supplier</button></div>
   `, ()=>{
     const name = document.getElementById('m-name').value.trim();
     const contactPerson = document.getElementById('m-contact').value.trim();
     const email = document.getElementById('m-email').value.trim();
     const ccEmail = document.getElementById('m-cc').value.trim();
+    const sendDirect = document.getElementById('m-direct').checked;
     if(!name){ toast('Enter a supplier name', 'err'); return false; }
-    dbRef('suppliers/' + sid).update({ name, contactPerson, email, ccEmail });
+    dbRef('suppliers/' + sid).update({ name, contactPerson, email, ccEmail, sendDirect });
     return true;
   });
   setTimeout(()=>{
