@@ -116,6 +116,7 @@
 
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-storage-compat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 
@@ -376,6 +377,7 @@ function attachListeners(){
   base.child('people').on('value', snap => { State.people = snap.val() || {}; onDataChange(); });
   base.child('transactions').on('value', snap => { State.transactions = snap.val() || {}; onDataChange(); });
   base.child('suppliers').on('value', snap => { State.suppliers = snap.val() || {}; onDataChange(); });
+  base.child('countLog').limitToLast(20).on('value', snap => { State.countLog = snap.val() || {}; onDataChange(); });
   base.child('meta').on('value', snap => {
     const m = snap.val() || {};
     CONFIG.REORDER_EMAIL = m.reorderEmail || '';
@@ -549,8 +551,8 @@ function sendSupplierReorderEmail(supplierId, items){
 
 // Manual "send now" for a supplier, from the Suppliers tab — bypasses the queue/debounce.
 function sendReorderEmailNowForSupplier(supplierId){
-  const lowScrews = Object.values(State.screwItems||{}).filter(i=> totalScrewQty(i) <= i.reorderQty && (i.supplierId||'__none') === supplierId)
-    .map(i=>({ itemLabel: i.size, currentQty: totalScrewQty(i), reorderQty: i.reorderQty }));
+  const lowScrews = Object.values(State.screwItems||{}).filter(i=> stockAmount(i) <= i.reorderQty && (i.supplierId||'__none') === supplierId)
+    .map(i=>({ itemLabel: itemName(i) + ' (' + unitWord(i) + ')', currentQty: stockTotalLabel(i), reorderQty: i.reorderQty }));
   const lowCons = Object.entries(State.consumableTypes||{}).filter(([tid,t])=>
     isConsumableTypeLow(tid, t) && (t.supplierId||'__none') === supplierId
   ).map(([tid,t])=> ({ itemLabel: t.name, currentQty: consumableTypeQty(tid,t), reorderQty: consumableTypeReorderLevel(t), isVolume: t.category==='liquid' }));
@@ -583,6 +585,7 @@ function render(){
   else if(State.activeTab === 'reports') main.appendChild(renderReportsTab());
   else if(State.activeTab === 'suppliers') main.appendChild(renderSuppliersTab());
   else if(State.activeTab === 'dispatch') main.appendChild(renderSendToDispatchTab());
+  else if(State.activeTab === 'count') main.appendChild(renderCountTab());
   else if(State.activeTab === 'admin') main.appendChild(renderAdminTab());
   app.appendChild(main);
 }
@@ -677,13 +680,14 @@ function renderTopbar(){
 function renderTabs(){
   const tabs = el('div','tabs');
   const items = [
-    ['screws','Screws'],
-    ['consumables','Thinners & Stopping'],
-    ['people','People'],
+    ['screws','Consumables'],
+    ['consumables','Liquid'],
+    ['people','Allocations'],
     ['suppliers','Suppliers'],
   ];
   // "View reports" permission was being ignored — the tab showed for everyone.
   if(can('consViewReports') || can('consExportExcel')) items.splice(3, 0, ['reports','Reports & Export']);
+  if(can('consManageItems')) items.push(['count','Stock Count']);
   if(can('consSendToDispatch')) items.push(['dispatch','Send to Dispatch']);
   if(State.currentUser.isRoot || can('manageUsers')) items.push(['admin','Admin']);
   items.forEach(([key,label])=>{
@@ -699,33 +703,137 @@ function renderTabs(){
 function el(tag, cls){ const e = document.createElement(tag); if(cls) e.className = cls; return e; }
 
 /* ---------- Screws Tab ---------- */
+/* ---------- Counted items: Consumables tab + stain tins on the Liquid tab ----------
+   Changed 2026-09-24 per user request: the old "Screws" tab is now
+   "Consumables", and every item picks a unit —
+     per500 : screws, counted in bundles (of 500 by default)
+     each   : hinges, sanding pads, wood stopping tubs (optional 250 g /
+              500 g / 1 kg size — each tub counted individually)
+     roll   : production rolls — whole rolls counted, plus ONE open roll
+              per location marked Full / 3/4 / 1/2 / 1/4
+     tin    : stains etc. bought in 500 ml or 1 L tins — shown on the
+              Liquid tab, counted per tin
+   They all live in the same screwItems list, so hand-out, restock, Send
+   to Dispatch, reports, Excel and the weekly reorder email keep working
+   for every kind. Items saved before this change have no unit and are
+   treated as per500 screws, exactly as before. */
+// Extended 2026-09-24 after researching what joinery workshops actually
+// stock (Blum/Hettich hardware, Klingspor abrasives, PVC edging, SA
+// cabinet-fitting wholesalers): packs of N (screws, confirmats, cam
+// locks, shelf pins, sanding discs), each (hinges, plates, handles,
+// legs, cartridges, stopping tubs), PAIRS (drawer runners are always
+// sold left+right, by length), rolls (edging, production paper, tape,
+// stretch wrap) and tins (stains/lacquers).
+const ITEM_UNITS = {
+  per500: { label: 'per 500', word: 'pack(s)',  tab: 'screws' },
+  each:   { label: 'each',    word: 'each',     tab: 'screws' },
+  pair:   { label: 'pairs',   word: 'pair(s)',  tab: 'screws' },
+  roll:   { label: 'rolls',   word: 'roll(s)',  tab: 'screws' },
+  tin:    { label: 'tins',    word: 'tin(s)',   tab: 'consumables' }
+};
+const ITEM_CATEGORIES = [
+  'Screws & fasteners', 'Knock-down fittings', 'Hinges & hinge plates', 'Drawer runners',
+  'Handles, knobs & legs', 'Brackets, stays & supports', 'Locks & catches', 'Edging',
+  'Adhesives & sealants', 'Fillers & stopping', 'Abrasives', 'Packaging & protection',
+  'Workshop & PPE', 'Stains & finishes', 'Other'
+];
+const DEFAULT_CATEGORY = { per500: 'Screws & fasteners', each: 'Other', pair: 'Drawer runners', roll: 'Packaging & protection', tin: 'Stains & finishes' };
+// Size suggestions (free text is allowed too) — the common ones for each unit.
+const SIZE_SUGGESTIONS = {
+  each: ['250 g', '500 g', '1 kg', '5 kg', '25 kg', '290 ml cartridge', '110°', '155°', '170°', '0 mm plate', '3 mm plate', '125 mm', '150 mm', 'P80', 'P120', 'P180', 'P240', 'P320'],
+  roll: ['22 mm x 0.45 mm', '22 mm x 1 mm', '22 mm x 2 mm', '100 m', '200 m', '24 mm tape', '48 mm tape', '500 mm stretch wrap'],
+  per500: ['4 x 16', '4 x 30', '4 x 40', '6 x 16', '7 x 50 confirmat', '15 mm cam', '5 mm shelf pin', '8 x 30 dowel', 'P120', '125 mm']
+};
+const EACH_SIZES = SIZE_SUGGESTIONS.each; // kept for older code paths
+const RUNNER_LENGTHS = ['250 mm', '270 mm', '300 mm', '350 mm', '400 mm', '450 mm', '500 mm', '550 mm', '600 mm'];
+const TIN_SIZES = ['250 ml', '500 ml', '1 L', '5 L', '20 L'];
+const ROLL_LEVELS = ['Full', '3/4', '1/2', '1/4'];
+const ROLL_FRACTION = { 'Full': 1, '3/4': 0.75, '1/2': 0.5, '1/4': 0.25 };
+const ROLL_SYMBOL = { 'Full': 'full', '3/4': '¾', '1/2': '½', '1/4': '¼' };
+
+function itemUnit(item){ return (item && ITEM_UNITS[item.unit]) ? item.unit : 'per500'; }
+function unitWord(item){ return ITEM_UNITS[itemUnit(item)].word; }
+function itemName(item){ return (item.size || '') + (item.packSize ? ' (' + item.packSize + ')' : ''); }
+function itemCategory(item){
+  return (item && item.category) || DEFAULT_CATEGORY[itemUnit(item)] || 'Other';
+}
+function unitLabel(item){
+  const u = itemUnit(item);
+  if(u === 'per500') return 'pack of ' + (item.bundleSize || 500);
+  if(u === 'tin') return (item.packSize || '') + ' tins';
+  return ITEM_UNITS[u].label;
+}
+function openRollAt(item, location){ return (item.openRollByLocation && item.openRollByLocation[location]) || null; }
+function openRollTotal(item){
+  return Object.values(item.openRollByLocation || {}).reduce((a, l) => a + (ROLL_FRACTION[l] || 0), 0);
+}
+// What counts toward "low stock": whole units, plus open-roll fractions for rolls.
+function stockAmount(item){
+  return totalScrewQty(item) + (itemUnit(item) === 'roll' ? openRollTotal(item) : 0);
+}
+function stockAtLabel(item, location){
+  const n = screwQtyAt(item, location);
+  if(itemUnit(item) !== 'roll') return String(n);
+  const open = openRollAt(item, location);
+  return open ? `${n} + ${ROLL_SYMBOL[open]} open` : String(n);
+}
+function stockTotalLabel(item){
+  const n = totalScrewQty(item);
+  if(itemUnit(item) !== 'roll') return `${n}`;
+  const opens = Object.values(item.openRollByLocation || {}).filter(Boolean);
+  return opens.length ? `${n} + ${opens.map(l => ROLL_SYMBOL[l]).join(' + ')} open` : `${n}`;
+}
+function itemsForTab(tabKey){
+  return Object.entries(State.screwItems || {})
+    .filter(([id, item]) => ITEM_UNITS[itemUnit(item)].tab === tabKey)
+    .sort((a, b) => itemName(a[1]).localeCompare(itemName(b[1]), undefined, { numeric: true }));
+}
+
 function renderScrewsTab(){
-  const wrap = document.createDocumentFragment ? el('div','') : el('div','');
-  const items = Object.entries(State.screwItems || {}).sort((a,b)=> a[1].size.localeCompare(b[1].size, undefined, {numeric:true}));
+  const container = el('div', '');
+  container.appendChild(renderCountedCard('screws'));
+  return container;
+}
+
+function renderCountedCard(tabKey){
+  const onLiquidTab = tabKey === 'consumables';
+  const items = itemsForTab(tabKey);
   const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
 
-  const card = el('div','card');
-  const header = el('div','');
-  header.innerHTML = `<h2>Screw stock</h2><div class="sub">Quantities are in bundles of 500 unless the item says otherwise. Location breakdown shown per row.</div>`;
+  const card = el('div', 'card');
+  const header = el('div', '');
+  header.innerHTML = onLiquidTab
+    ? `<h2>Tins (stains, lacquers etc.)</h2><div class="sub">Counted per tin — pick the tin size (250 ml, 500 ml, 1 L, 5 L or 20 L) for each item.</div>`
+    : `<h2>Consumables</h2><div class="sub">Grouped by category. Screws and fittings in packs (per 500 etc.), hinges, plates and stopping tubs each, drawer runners in pairs, and rolls (edging, production rolls) as whole rolls plus the open roll (Full / ¾ / ½ / ¼).</div>`;
   card.appendChild(header);
 
   if(items.length === 0){
-    card.appendChild(elHtml('div','empty','No screw sizes added yet.'));
+    card.appendChild(elHtml('div', 'empty', onLiquidTab ? 'No tins added yet.' : 'No consumables added yet.'));
   } else {
     const table = document.createElement('table');
-    table.innerHTML = `<thead><tr><th>Size</th><th>Bundle size</th><th>On hand (bundles)</th><th>By location</th><th>Reorder at</th><th>Supplier</th><th>Status</th><th></th></tr></thead>`;
+    table.innerHTML = `<thead><tr><th>Item</th><th>Unit</th><th>On hand</th><th>By location</th><th>Reorder at</th><th>Supplier</th><th>Status</th><th></th></tr></thead>`;
     const tbody = document.createElement('tbody');
-    items.forEach(([id,item])=>{
-      const total = totalScrewQty(item);
-      const low = total <= item.reorderQty;
+    // Grouped by category, in the order of ITEM_CATEGORIES.
+    const catOrder = c => { const i = ITEM_CATEGORIES.indexOf(c); return i < 0 ? 999 : i; };
+    items.sort((a, b) => (catOrder(itemCategory(a[1])) - catOrder(itemCategory(b[1]))) || itemName(a[1]).localeCompare(itemName(b[1]), undefined, { numeric: true }));
+    let lastCat = null;
+    items.forEach(([id, item]) => {
+      const cat = itemCategory(item);
+      if(!onLiquidTab && cat !== lastCat){
+        const hr = document.createElement('tr');
+        hr.innerHTML = `<td colspan="8" style="font-weight:700;padding-top:14px;color:var(--amber, #d59a3a);">${escapeHtml(cat)}</td>`;
+        tbody.appendChild(hr);
+        lastCat = cat;
+      }
+      const low = stockAmount(item) <= item.reorderQty;
       const supplierName = item.supplierId && State.suppliers[item.supplierId] ? State.suppliers[item.supplierId].name : '—';
-      const breakdown = locations.map(l => `${escapeHtml(l)}: ${screwQtyAt(item, l)}`).join(', ');
+      const breakdown = locations.map(l => `${escapeHtml(l)}: ${stockAtLabel(item, l)}`).join(', ');
       const tr = document.createElement('tr');
       if(low) tr.className = 'low-stock';
       tr.innerHTML = `
-        <td>${escapeHtml(item.size)}</td>
-        <td class="num">${item.bundleSize}</td>
-        <td class="num">${total}</td>
+        <td>${thumbHtml(item.photoUrl)}${escapeHtml(itemName(item))}</td>
+        <td>${escapeHtml(unitLabel(item))}</td>
+        <td class="num">${escapeHtml(stockTotalLabel(item))}</td>
         <td class="sub" style="font-size:12px;">${breakdown}</td>
         <td class="num">${item.reorderQty}</td>
         <td>${escapeHtml(supplierName)}</td>
@@ -734,14 +842,18 @@ function renderScrewsTab(){
       `;
       const actionsTd = tr.lastElementChild;
       if(can('consHandOut')){
-        const outBtn = smallBtn('Hand out', ()=> openHandOutModal('screw', id));
-        actionsTd.appendChild(outBtn);
+        actionsTd.appendChild(smallBtn('Hand out', () => openHandOutModal('screw', id)));
+      }
+      if(itemUnit(item) === 'roll' && can('consManageConsumables')){
+        const rollBtn = smallBtn('Open roll', () => openRollModal(id));
+        rollBtn.style.marginLeft = '6px';
+        actionsTd.appendChild(rollBtn);
       }
       if(can('consManageItems')){
-        const restockBtn = smallBtn('Restock', ()=> openRestockModal('screw', id));
+        const restockBtn = smallBtn('Restock', () => openRestockModal('screw', id));
         restockBtn.style.marginLeft = '6px';
         actionsTd.appendChild(restockBtn);
-        const editBtn = smallBtn('Edit', ()=> openEditScrewModal(id));
+        const editBtn = smallBtn('Edit', () => openEditScrewModal(id));
         editBtn.style.marginLeft = '6px';
         actionsTd.appendChild(editBtn);
       }
@@ -752,18 +864,15 @@ function renderScrewsTab(){
   }
 
   if(can('consManageItems')){
-    const row = el('div','btn-row');
+    const row = el('div', 'btn-row');
     const addBtn = document.createElement('button');
     addBtn.className = 'btn btn-amber';
-    addBtn.textContent = '+ Add screw size';
-    addBtn.onclick = openAddScrewModal;
+    addBtn.textContent = onLiquidTab ? '+ Add tin item (stain etc.)' : '+ Add consumable';
+    addBtn.onclick = () => openAddScrewModal(onLiquidTab ? 'tin' : 'per500');
     row.appendChild(addBtn);
     card.appendChild(row);
   }
-
-  const container = el('div','');
-  container.appendChild(card);
-  return container;
+  return card;
 }
 
 function smallBtn(label, onClick){
@@ -787,56 +896,174 @@ function locationSelectHtml(id, selected){
   return `<label>Location</label><select id="${id}">${locations.map(l=>`<option value="${escapeHtml(l)}" ${l===selected?'selected':''}>${escapeHtml(l)}</option>`).join('')}</select>`;
 }
 
-function openAddScrewModal(){
-  openModal('Add screw size', `
-    <label>Size (e.g. 6 x 16)</label>
+
+// ---------- Item photos (2026-09-24) ----------
+// A photo per item so staff pick the right hinge / runner / edging. Photos
+// are shrunk on the phone (max 800 px) and stored in Firebase Storage
+// (consumablePhotos/); only the link is saved on the item.
+function shrinkPhoto(file, maxSide){
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, (maxSide || 800) / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      c.toBlob(b => resolve(b), 'image/jpeg', 0.8);
+    };
+    img.onerror = () => resolve(null);
+    img.src = URL.createObjectURL(file);
+  });
+}
+async function uploadItemPhoto(collection, id, file){
+  try{
+    const blob = await shrinkPhoto(file, 800);
+    if(!blob) throw new Error('Could not read that photo');
+    const ref = firebase.storage().ref(`consumablePhotos/${collection}-${id}.jpg`);
+    await ref.put(blob, { contentType: 'image/jpeg' });
+    const url = await ref.getDownloadURL();
+    await dbRef(collection + '/' + id + '/photoUrl').set(url);
+    toast('Photo saved', 'ok');
+  }catch(e){
+    toast('Photo could not be saved: ' + (e.message || e), 'err');
+  }
+}
+function photoFieldHtml(currentUrl){
+  return `<label>Photo (optional)</label>
+    ${currentUrl ? `<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;"><img src="${currentUrl}" style="width:64px;height:64px;object-fit:cover;border-radius:6px;"><label style="font-weight:400;display:flex;align-items:center;gap:6px;"><input type="checkbox" id="m-photo-remove" style="width:auto;"> Remove photo</label></div>` : ''}
+    <input type="file" id="m-photo" accept="image/*" capture="environment">`;
+}
+function readPhotoField(){
+  const f = document.getElementById('m-photo');
+  const rm = document.getElementById('m-photo-remove');
+  return { file: f && f.files && f.files[0] ? f.files[0] : null, remove: !!(rm && rm.checked) };
+}
+function thumbHtml(url){
+  return url ? `<img src="${url}" alt="" onclick="window.open('${url}','_blank')" style="width:36px;height:36px;object-fit:cover;border-radius:5px;vertical-align:middle;margin-right:8px;cursor:zoom-in;">` : '';
+}
+
+// Unit + size + category fields shared by the Add and Edit forms.
+function unitFieldsHtml(item, lockedToTin){
+  const unit = itemUnit(item);
+  const cat = (item && item.category) || DEFAULT_CATEGORY[unit];
+  const unitSelect = lockedToTin
+    ? `<input type="hidden" id="m-unit" value="tin">`
+    : `<label>Unit</label><select id="m-unit">
+         <option value="per500" ${unit==='per500'?'selected':''}>Pack / box of N (screws per 500, confirmats, cam locks, sanding discs…)</option>
+         <option value="each" ${unit==='each'?'selected':''}>Each (hinges, plates, handles, stopping tubs, cartridges…)</option>
+         <option value="pair" ${unit==='pair'?'selected':''}>Pairs (drawer runners — left + right)</option>
+         <option value="roll" ${unit==='roll'?'selected':''}>Rolls (edging, production rolls, tape — open roll in ¼ steps)</option>
+       </select>`;
+  const catSelect = lockedToTin
+    ? `<input type="hidden" id="m-category" value="${escapeHtml(cat || 'Stains & finishes')}">`
+    : `<label>Category</label><select id="m-category">${ITEM_CATEGORIES.map(c => `<option value="${escapeHtml(c)}" ${c===cat?'selected':''}>${escapeHtml(c)}</option>`).join('')}</select>`;
+  const curSize = (item && item.packSize) || '';
+  const lenVal = (item && item.unit === 'pair') ? curSize : '450 mm';
+  const tinVal = (item && item.unit === 'tin') ? (curSize || '1 L') : '1 L';
+  return `${unitSelect}
+    <div id="m-bundle-wrap"><label>How many in a pack / box</label><input type="number" id="m-bundle" value="${(item && item.bundleSize) || 500}"></div>
+    <div id="m-size-wrap"><label>Size / spec (optional — pick or type)</label>
+      <input type="text" id="m-sizespec" list="m-size-list" value="${escapeHtml((item && item.unit !== 'pair' && item.unit !== 'tin') ? curSize : '')}" placeholder="e.g. 500 g, 110°, 22 mm x 1 mm">
+      <datalist id="m-size-list"></datalist></div>
+    <div id="m-length-wrap"><label>Runner length</label>
+      <select id="m-length">${RUNNER_LENGTHS.map(s => `<option value="${s}" ${s===lenVal?'selected':''}>${s}</option>`).join('')}${lenVal && !RUNNER_LENGTHS.includes(lenVal) ? `<option value="${escapeHtml(lenVal)}" selected>${escapeHtml(lenVal)}</option>` : ''}</select></div>
+    <div id="m-tinsize-wrap"><label>Tin size</label>
+      <select id="m-tinsize">${TIN_SIZES.map(s => `<option value="${s}" ${s===tinVal?'selected':''}>${s}</option>`).join('')}</select></div>
+    ${catSelect}`;
+}
+function wireUnitFields(){
+  const sel = document.getElementById('m-unit');
+  const catSel = document.getElementById('m-category');
+  let lastUnit = sel.value;
+  const show = () => {
+    const u = sel.value;
+    document.getElementById('m-bundle-wrap').style.display = u === 'per500' ? 'block' : 'none';
+    document.getElementById('m-size-wrap').style.display = (u === 'each' || u === 'roll' || u === 'per500') ? 'block' : 'none';
+    document.getElementById('m-length-wrap').style.display = u === 'pair' ? 'block' : 'none';
+    document.getElementById('m-tinsize-wrap').style.display = u === 'tin' ? 'block' : 'none';
+    document.getElementById('m-size-list').innerHTML = (SIZE_SUGGESTIONS[u] || []).map(v => `<option value="${escapeHtml(v)}">`).join('');
+    document.querySelectorAll('.m-unitword').forEach(e => e.textContent = ITEM_UNITS[u].word);
+    // Follow the unit's usual category unless someone already picked a different one.
+    if(catSel && catSel.tagName === 'SELECT' && catSel.value === DEFAULT_CATEGORY[lastUnit]) catSel.value = DEFAULT_CATEGORY[u];
+    lastUnit = u;
+  };
+  if(sel.tagName === 'SELECT') sel.onchange = show;
+  show();
+}
+function readUnitFields(){
+  const unit = document.getElementById('m-unit').value;
+  const out = { unit, packSize: '', bundleSize: null, category: document.getElementById('m-category').value || DEFAULT_CATEGORY[unit] };
+  if(unit === 'per500') out.bundleSize = parseInt(document.getElementById('m-bundle').value) || 500;
+  if(unit === 'each' || unit === 'roll' || unit === 'per500') out.packSize = document.getElementById('m-sizespec').value.trim();
+  if(unit === 'pair') out.packSize = document.getElementById('m-length').value;
+  if(unit === 'tin') out.packSize = document.getElementById('m-tinsize').value;
+  return out;
+}
+
+function openAddScrewModal(defaultUnit){
+  defaultUnit = defaultUnit || 'per500';
+  const isTin = defaultUnit === 'tin';
+  openModal(isTin ? 'Add tin item' : 'Add consumable', `
+    <label>${isTin ? 'Name (e.g. Oak stain, Clear lacquer)' : 'Name (e.g. Chipboard screw, Blum soft-close hinge, Tandem runner, PVC edging white, Sanding disc)'}</label>
     <input type="text" id="m-size">
+    ${unitFieldsHtml({ unit: defaultUnit }, isTin)}
     <div class="row2">
-      <div><label>Bundle size</label><input type="number" id="m-bundle" value="500"></div>
-      <div><label>Reorder at (bundles)</label><input type="number" id="m-reorder" value="2"></div>
+      <div><label>Reorder at (<span class="m-unitword"></span>)</label><input type="number" id="m-reorder" value="2"></div>
+      <div><label>Starting qty (<span class="m-unitword"></span>)</label><input type="number" id="m-qty" value="0"></div>
     </div>
-    <label>Starting qty (bundles)</label>
-    <input type="number" id="m-qty" value="0">
     ${locationSelectHtml('m-loc', null)}
     ${supplierSelectHtml('m-supplier', null)}
+    ${photoFieldHtml(null)}
   `, ()=>{
     const size = document.getElementById('m-size').value.trim();
-    const bundleSize = parseInt(document.getElementById('m-bundle').value) || 500;
+    const photo = readPhotoField();
+    const u = readUnitFields();
     const reorderQty = parseInt(document.getElementById('m-reorder').value) || 0;
     const qty = parseInt(document.getElementById('m-qty').value) || 0;
     const location = document.getElementById('m-loc').value;
     const supplierId = document.getElementById('m-supplier').value || null;
-    if(!size){ toast('Enter a size', 'err'); return false; }
-    dbRef('screwItems/' + uid()).set({ size, bundleSize, qtyByLocation: { [location]: qty }, reorderQty, reorderSent:false, supplierId });
+    if(!size){ toast('Enter a name', 'err'); return false; }
+    const rec = { size, unit: u.unit, category: u.category, qtyByLocation: { [location]: qty }, reorderQty, reorderSent:false, supplierId };
+    if(u.bundleSize) rec.bundleSize = u.bundleSize;
+    if(u.packSize) rec.packSize = u.packSize;
+    const newId = uid();
+    dbRef('screwItems/' + newId).set(rec).then(() => { if(photo.file) uploadItemPhoto('screwItems', newId, photo.file); });
     return true;
   });
+  setTimeout(wireUnitFields);
 }
 
 function openEditScrewModal(id){
   const item = State.screwItems[id];
-  openModal('Edit ' + item.size, `
-    <label>Size</label>
+  const isTin = itemUnit(item) === 'tin';
+  openModal('Edit ' + itemName(item), `
+    <label>Name</label>
     <input type="text" id="m-size" value="${escapeHtml(item.size)}">
-    <div class="row2">
-      <div><label>Bundle size</label><input type="number" id="m-bundle" value="${item.bundleSize}"></div>
-      <div><label>Reorder at (bundles)</label><input type="number" id="m-reorder" value="${item.reorderQty}"></div>
-    </div>
+    ${unitFieldsHtml(item, isTin)}
+    <label>Reorder at (<span class="m-unitword"></span>)</label><input type="number" id="m-reorder" value="${item.reorderQty}">
     ${supplierSelectHtml('m-supplier', item.supplierId)}
+    ${photoFieldHtml(item.photoUrl)}
     <div class="btn-row"><button class="btn btn-danger" id="m-delete" type="button">Delete this item</button></div>
   `, ()=>{
     const size = document.getElementById('m-size').value.trim();
-    const bundleSize = parseInt(document.getElementById('m-bundle').value) || 500;
+    const photo = readPhotoField();
+    const u = readUnitFields();
     const reorderQty = parseInt(document.getElementById('m-reorder').value) || 0;
     const supplierId = document.getElementById('m-supplier').value || null;
-    if(!size){ toast('Enter a size', 'err'); return false; }
-    dbRef('screwItems/' + id).update({ size, bundleSize, reorderQty, supplierId });
-    checkReorder('screw', id, size, totalScrewQty(item), reorderQty, item.reorderSent, supplierId);
+    if(!size){ toast('Enter a name', 'err'); return false; }
+    const upd = { size, unit: u.unit, category: u.category, reorderQty, supplierId, bundleSize: u.bundleSize || null, packSize: u.packSize || null };
+    if(u.unit !== 'roll') upd.openRollByLocation = null;
+    if(photo.remove && !photo.file) upd.photoUrl = null;
+    dbRef('screwItems/' + id).update(upd);
+    if(photo.file) uploadItemPhoto('screwItems', id, photo.file);
+    checkReorder('screw', id, size, stockAmount({ ...item, ...upd }), reorderQty, item.reorderSent, supplierId);
     return true;
   });
   setTimeout(()=>{
+    wireUnitFields();
     const del = document.getElementById('m-delete');
     if(del) del.onclick = ()=>{
-      if(confirm('Delete ' + item.size + '? This cannot be undone.')){
+      if(confirm('Delete ' + itemName(item) + '? This cannot be undone.')){
         dbRef('screwItems/' + id).remove();
         closeModal();
       }
@@ -844,11 +1071,63 @@ function openEditScrewModal(id){
   });
 }
 
+// Production rolls: set how full the open roll is at a location, optionally
+// taking a fresh roll from the full-roll count to open it.
+function openRollModal(id){
+  const item = State.screwItems[id];
+  const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
+  openModal('Open roll — ' + itemName(item), `
+    ${locationSelectHtml('m-loc', null)}
+    <label>Open roll is now</label>
+    <select id="m-level">
+      ${ROLL_LEVELS.map(l => `<option value="${l}">${l === 'Full' ? 'Full' : l}</option>`).join('')}
+      <option value="">Finished / no open roll</option>
+    </select>
+    <label style="display:flex;align-items:center;gap:7px;font-weight:400;margin-top:10px;">
+      <input type="checkbox" id="m-newroll" style="width:auto;"> Take a new roll from stock to open (−1 full roll)
+    </label>
+    <div class="sub" id="m-rollnow" style="margin-top:8px"></div>
+  `, ()=>{
+    const location = document.getElementById('m-loc').value;
+    const level = document.getElementById('m-level').value;
+    const takeNew = document.getElementById('m-newroll').checked;
+    const open = { ...(item.openRollByLocation || {}) };
+    if(level) open[location] = level; else delete open[location];
+    if(takeNew){
+      const here = screwQtyAt(item, location);
+      if(here < 1 && !confirm(`There are no full rolls left at ${location}. Open one anyway? Stock will show as negative there.`)) return false;
+      const q = { ...(item.qtyByLocation || {}) };
+      q[location] = here - 1;
+      dbRef('screwItems/' + id + '/qtyByLocation').set(q);
+      item.qtyByLocation = q;
+    }
+    dbRef('screwItems/' + id + '/openRollByLocation').set(Object.keys(open).length ? open : null);
+    item.openRollByLocation = open;
+    checkReorder('screw', id, itemName(item), stockAmount(item), item.reorderQty, item.reorderSent, item.supplierId);
+    toast('Updated ' + itemName(item), 'ok');
+    return true;
+  });
+  setTimeout(()=>{
+    const locSel = document.getElementById('m-loc');
+    const lvl = document.getElementById('m-level');
+    const info = document.getElementById('m-rollnow');
+    const sync = () => {
+      const cur = openRollAt(item, locSel.value);
+      lvl.value = cur || 'Full';
+      info.textContent = `At ${locSel.value}: ${screwQtyAt(item, locSel.value)} full roll(s)` + (cur ? `, open roll ${ROLL_SYMBOL[cur]}` : ', no open roll');
+      document.getElementById('m-newroll').checked = !cur;
+    };
+    locSel.onchange = sync;
+    sync();
+  });
+}
+
 function openRestockModal(kind, id){
   const item = kind === 'screw' ? State.screwItems[id] : State.consumableTypes[id];
-  const label = kind === 'screw' ? item.size : item.name;
+  const label = kind === 'screw' ? itemName(item) : item.name;
+  const word = kind === 'screw' ? unitWord(item) : 'bundle(s)';
   openModal('Restock ' + label, `
-    <label>Bundles to add</label>
+    <label>Amount to add (${word})</label>
     <input type="number" id="m-add" value="1" min="1">
     ${kind === 'screw' ? locationSelectHtml('m-loc', null) : ''}
   `, ()=>{
@@ -859,69 +1138,282 @@ function openRestockModal(kind, id){
       if(!item.qtyByLocation) item.qtyByLocation = {};
       item.qtyByLocation[location] = (item.qtyByLocation[location] || 0) + add;
       dbRef('screwItems/' + id + '/qtyByLocation').set(item.qtyByLocation);
-      checkReorder('screw', id, label, totalScrewQty(item), item.reorderQty, item.reorderSent, item.supplierId);
+      checkReorder('screw', id, label, stockAmount(item), item.reorderQty, item.reorderSent, item.supplierId);
     }
     toast('Restocked ' + label, 'ok');
     return true;
   });
 }
 
+
+// ---------- Allocation (2026-09-24, per user request) ----------
+// "one user hands out the stock so he can allocate to which user it's
+// allocated, or when it's sent out to site or head office straight".
+// The logged-in user is saved as handedOutBy; the dropdown picks where
+// it went: a team member (the shared login list), another named person,
+// a site/job, or Head office. Each destination is also a People entry
+// so the People tab and Excel export keep grouping by recipient.
+function allocationSelectHtml(){
+  const users = (State.sharedUsers || []).filter(u => u && u.username).map(u => u.username)
+    .sort((a, b) => a.localeCompare(b));
+  const userSet = new Set(users.map(n => n.toLowerCase()));
+  const others = Object.entries(State.people || {})
+    .filter(([pid, p]) => p && p.name && !p.kind && !userSet.has(p.name.toLowerCase()))
+    .sort((a, b) => a[1].name.localeCompare(b[1].name));
+  const sites = [...new Set(Object.values(State.people || {}).filter(p => p && p.kind === 'site').map(p => p.name.replace(/^Site — /, '')))].sort();
+  return `
+    <label>Allocate to</label>
+    <select id="m-alloc">
+      <optgroup label="Team members">${users.map(n => `<option value="user:${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('')}</optgroup>
+      ${others.length ? `<optgroup label="Other people">${others.map(([pid, p]) => `<option value="person:${pid}">${escapeHtml(p.name)}</option>`).join('')}</optgroup>` : ''}
+      <optgroup label="Sent out">
+        <option value="site">🚚 Sent to site…</option>
+        <option value="headoffice">🏢 Head office</option>
+      </optgroup>
+      <option value="__new">+ New person…</option>
+    </select>
+    <div id="m-newname-wrap" style="display:none"><label>New person's name</label><input type="text" id="m-newname"></div>
+    <div id="m-site-wrap" style="display:none"><label>Site / job name</label>
+      <input type="text" id="m-site" list="m-site-list" placeholder="e.g. NH Hotel">
+      <datalist id="m-site-list">${sites.map(x => `<option value="${escapeHtml(x)}">`).join('')}</datalist></div>
+    <div class="sub" style="margin-top:4px">Handed out by: <b>${escapeHtml((State.currentUser && State.currentUser.username) || '—')}</b></div>`;
+}
+function wireAllocationSelect(){
+  const sel = document.getElementById('m-alloc');
+  if(!sel) return;
+  const sync = () => {
+    document.getElementById('m-newname-wrap').style.display = sel.value === '__new' ? 'block' : 'none';
+    document.getElementById('m-site-wrap').style.display = sel.value === 'site' ? 'block' : 'none';
+  };
+  sel.onchange = sync;
+  sync();
+}
+// Returns { personId, recipientType, recipientName } — or null (after a toast) if something's missing.
+function resolveAllocation(){
+  const v = document.getElementById('m-alloc').value;
+  let name, type;
+  if(v.startsWith('person:')){
+    const pid = v.slice(7);
+    return { personId: pid, recipientType: 'person', recipientName: (State.people[pid] || {}).name || '' };
+  }
+  if(v.startsWith('user:')){ name = v.slice(5); type = 'user'; }
+  else if(v === 'site'){
+    const site = document.getElementById('m-site').value.trim();
+    if(!site){ toast('Enter the site / job name', 'err'); return null; }
+    name = 'Site — ' + site; type = 'site';
+  }
+  else if(v === 'headoffice'){ name = 'Head office'; type = 'headoffice'; }
+  else {
+    name = document.getElementById('m-newname').value.trim(); type = 'person';
+    if(!name){ toast("Enter the new person's name", 'err'); return null; }
+  }
+  const existing = Object.entries(State.people || {}).find(([pid, p]) => p && (p.name || '').toLowerCase() === name.toLowerCase());
+  if(existing) return { personId: existing[0], recipientType: type, recipientName: existing[1].name };
+  const pid = uid();
+  const rec = { name };
+  if(type === 'site' || type === 'headoffice') rec.kind = type;
+  if(type === 'user') rec.kind = 'user';
+  dbRef('people/' + pid).set(rec);
+  if(!State.people) State.people = {};
+  State.people[pid] = rec;
+  return { personId: pid, recipientType: type, recipientName: name };
+}
+function currentUsername(){ return (State.currentUser && State.currentUser.username) || 'Unknown'; }
+
 function openHandOutModal(kind, id){
   const item = State.screwItems[id];
-  const people = Object.entries(State.people || {}).sort((a,b)=> a[1].name.localeCompare(b[1].name));
-  const peopleOpts = people.map(([pid,p])=> `<option value="${pid}">${escapeHtml(p.name)}</option>`).join('');
-  openModal('Hand out ' + item.size, `
-    <label>Person</label>
-    <select id="m-person">
-      <option value="__new">+ New person…</option>
-      ${peopleOpts}
-    </select>
-    <div id="m-newname-wrap" style="display:none">
-      <label>New person's name</label>
-      <input type="text" id="m-newname">
-    </div>
+  const name = itemName(item);
+  const word = unitWord(item);
+  openModal('Hand out ' + name, `
+    ${item.photoUrl ? `<img src="${item.photoUrl}" alt="" style="max-width:100%;max-height:160px;border-radius:8px;margin-bottom:8px;">` : ''}
+    ${allocationSelectHtml()}
     ${locationSelectHtml('m-loc', null)}
     <div class="row2">
-      <div><label>Qty (bundles)</label><input type="number" id="m-qty" value="1" min="1"></div>
+      <div><label>Qty (${word})</label><input type="number" id="m-qty" value="1" min="1"></div>
       <div><label>Date</label><input type="date" id="m-date" value="${todayStr()}"></div>
     </div>
-    <div class="sub" style="margin-top:8px">Total on hand: ${totalScrewQty(item)} bundle(s)</div>
+    <div class="sub" style="margin-top:8px">Total on hand: ${escapeHtml(stockTotalLabel(item))} ${word}</div>
   `, ()=>{
     const qty = parseInt(document.getElementById('m-qty').value) || 0;
     const date = document.getElementById('m-date').value || todayStr();
     const location = document.getElementById('m-loc').value;
-    let personSel = document.getElementById('m-person').value;
     if(qty <= 0){ toast('Enter a positive qty', 'err'); return false; }
     const here = screwQtyAt(item, location);
-    if(qty > here){ if(!confirm('That is more than the ' + here + ' bundle(s) on hand at ' + location + '. Continue anyway?')) return false; }
+    if(qty > here){ if(!confirm('That is more than the ' + here + ' ' + word + ' on hand at ' + location + '. Continue anyway?')) return false; }
+    const alloc = resolveAllocation();
+    if(!alloc) return false;
 
     const finishPersonId = (personId)=>{
       if(!item.qtyByLocation) item.qtyByLocation = {};
       item.qtyByLocation[location] = here - qty;
       dbRef('screwItems/' + id + '/qtyByLocation').set(item.qtyByLocation);
-      checkReorder('screw', id, item.size, totalScrewQty(item), item.reorderQty, item.reorderSent, item.supplierId);
+      checkReorder('screw', id, name, stockAmount(item), item.reorderQty, item.reorderSent, item.supplierId);
       dbRef('transactions/' + uid()).set({
-        personId, itemType:'screw', itemId:id, itemLabel: item.size, qty, date, month: monthKey(date)
+        personId, itemType:'screw', itemId:id, itemLabel: name, unit: itemUnit(item), category: itemCategory(item), qty, date, month: monthKey(date),
+        recipientType: alloc.recipientType, recipientName: alloc.recipientName, handedOutBy: currentUsername(), location
       });
-      toast('Handed out ' + qty + ' bundle(s) of ' + item.size, 'ok');
+      toast('Handed out ' + qty + ' ' + word + ' of ' + name + ' → ' + alloc.recipientName, 'ok');
     };
-
-    if(personSel === '__new'){
-      const name = document.getElementById('m-newname').value.trim();
-      if(!name){ toast('Enter a name', 'err'); return false; }
-      const newId = uid();
-      dbRef('people/' + newId).set({ name });
-      finishPersonId(newId);
-    } else {
-      finishPersonId(personSel);
-    }
+    finishPersonId(alloc.personId);
     return true;
   });
-  setTimeout(()=>{
-    const sel = document.getElementById('m-person');
-    const wrap = document.getElementById('m-newname-wrap');
-    sel.onchange = ()=> wrap.style.display = (sel.value==='__new') ? 'block' : 'none';
+  setTimeout(wireAllocationSelect);
+}
+
+
+/* ---------- Stock Count (2026-09-24) ----------
+   Count what is physically on the shelves at one location: whole units
+   for packs/each/pairs/rolls/tins (plus how full the open roll is), and
+   litres for drum liquids. Blank = not counted. The difference shows as
+   you type; "Apply count" corrects everything counted in one go and keeps
+   a record (who, when, what changed) in countLog. Typed figures are kept
+   on this device until applied, so a count can be picked up later. */
+function consCountKey(loc){ return 'consCountDraft:' + loc; }
+function loadConsDraft(loc){ try{ return JSON.parse(localStorage.getItem(consCountKey(loc)) || '{}'); }catch(e){ return {}; } }
+function saveConsDraft(loc, d){ try{ localStorage.setItem(consCountKey(loc), JSON.stringify(d)); }catch(e){} }
+function countLoc(){
+  const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
+  if(!State.countLoc || !locations.includes(State.countLoc)) State.countLoc = locations[0];
+  return State.countLoc;
+}
+function countRows(loc){
+  const rows = [];
+  Object.entries(State.screwItems || {}).forEach(([id, item]) => {
+    rows.push({ key: 's:' + id, kind: 'item', id, item, label: itemName(item), unit: unitWord(item), cat: itemCategory(item),
+      sys: screwQtyAt(item, loc), isRoll: itemUnit(item) === 'roll', sysOpen: openRollAt(item, loc) || '' });
   });
+  Object.entries(State.consumableTypes || {}).filter(([tid, t]) => t.category === 'liquid').forEach(([tid, t]) => {
+    rows.push({ key: 'l:' + tid, kind: 'liquid', id: tid, item: t, label: t.name, unit: 'litres', cat: 'Liquids (by volume)',
+      sys: +(volumeAt(t, loc) / 1000).toFixed(2) });
+  });
+  const catOrder = c => { const i = ITEM_CATEGORIES.indexOf(c); return i < 0 ? 999 : i; };
+  return rows.sort((a, b) => (catOrder(a.cat) - catOrder(b.cat)) || a.label.localeCompare(b.label, undefined, { numeric: true }));
+}
+function countDiffText(row, d){
+  if(!d || (d.n === undefined && d.open === undefined)) return '—';
+  const parts = [];
+  if(d.n !== undefined){
+    const diff = +(d.n - row.sys).toFixed(2);
+    parts.push((diff > 0 ? '+' : '') + diff);
+  }
+  if(row.isRoll && d.open !== undefined && d.open !== row.sysOpen) parts.push(`open roll ${row.sysOpen || 'none'} → ${d.open || 'none'}`);
+  return parts.join(' · ') || '0';
+}
+function renderCountTab(){
+  const loc = countLoc();
+  const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
+  const draft = loadConsDraft(loc);
+  const rows = countRows(loc);
+  const wrap = el('div', '');
+  const card = el('div', 'card');
+  const recent = Object.values(State.countLog || {}).filter(c => c.location === loc).sort((a, b) => (b.ts || '').localeCompare(a.ts || ''))[0];
+  card.innerHTML = `<h2>Stock count</h2>
+    <div class="sub">Count what is physically at the location and type it in. Leave blank anything you didn't count. Nothing changes until you press <b>Apply count</b>.${recent ? `<br>Last count here: ${new Date(recent.ts).toLocaleString('en-GB')} by ${escapeHtml(recent.user)} (${recent.changes ? recent.changes.length : 0} correction(s)).` : ''}</div>
+    <label>Location</label>
+    <select id="cc-loc">${locations.map(l => `<option value="${escapeHtml(l)}" ${l === loc ? 'selected' : ''}>${escapeHtml(l)}</option>`).join('')}</select>`;
+  const table = document.createElement('table');
+  table.innerHTML = `<thead><tr><th>Item</th><th>System</th><th>Counted</th><th>Difference</th></tr></thead>`;
+  const tbody = document.createElement('tbody');
+  let lastCat = null;
+  rows.forEach(row => {
+    if(row.cat !== lastCat){
+      const hr = document.createElement('tr');
+      hr.innerHTML = `<td colspan="4" style="font-weight:700;padding-top:12px;color:var(--amber, #d59a3a);">${escapeHtml(row.cat)}</td>`;
+      tbody.appendChild(hr);
+      lastCat = row.cat;
+    }
+    const d = draft[row.key] || {};
+    const tr = document.createElement('tr');
+    const sysText = `${row.sys} ${row.unit}` + (row.isRoll ? (row.sysOpen ? ` + ${ROLL_SYMBOL[row.sysOpen]} open` : ', no open roll') : '');
+    tr.innerHTML = `<td>${escapeHtml(row.label)}</td><td class="sub">${escapeHtml(sysText)}</td>
+      <td><input type="number" min="0" step="${row.kind === 'liquid' ? '0.1' : '1'}" style="width:90px" value="${d.n !== undefined ? d.n : ''}" data-k="${row.key}">
+        ${row.isRoll ? `<select data-open="${row.key}" style="width:auto;margin-top:4px;"><option value="__same" ${d.open === undefined ? 'selected' : ''}>open roll: as is</option><option value="" ${d.open === '' ? 'selected' : ''}>no open roll</option>${ROLL_LEVELS.map(l => `<option value="${l}" ${d.open === l ? 'selected' : ''}>open roll ${ROLL_SYMBOL[l]}</option>`).join('')}</select>` : ''}</td>
+      <td id="ccd-${row.key.replace(':', '-')}">${escapeHtml(countDiffText(row, d))}</td>`;
+    tbody.appendChild(tr);
+  });
+  if(!rows.length) tbody.innerHTML = `<tr><td colspan="4" class="empty">No items to count yet.</td></tr>`;
+  table.appendChild(tbody);
+  card.appendChild(table);
+  const summary = el('div', 'sub'); summary.id = 'cc-summary'; summary.style.marginTop = '10px';
+  card.appendChild(summary);
+  const btnRow = el('div', 'btn-row');
+  const applyBtn = document.createElement('button'); applyBtn.className = 'btn btn-amber'; applyBtn.textContent = 'Apply count'; applyBtn.id = 'cc-apply';
+  applyBtn.onclick = () => applyConsCount();
+  const clearBtn = document.createElement('button'); clearBtn.className = 'btn btn-ghost'; clearBtn.textContent = 'Clear';
+  clearBtn.onclick = () => { if(confirm('Clear the figures typed for this location?')){ saveConsDraft(loc, {}); render(); } };
+  btnRow.appendChild(applyBtn); btnRow.appendChild(clearBtn);
+  card.appendChild(btnRow);
+  wrap.appendChild(card);
+
+  const byKey = Object.fromEntries(rows.map(r => [r.key, r]));
+  const refreshSummary = () => {
+    const dr = loadConsDraft(loc);
+    const keys = Object.keys(dr);
+    const changes = keys.filter(k => byKey[k] && countDiffText(byKey[k], dr[k]) !== '0' && countDiffText(byKey[k], dr[k]) !== '—').length;
+    summary.textContent = keys.length ? `${keys.length} item(s) counted · ${changes} with a difference` : 'Nothing counted yet.';
+    applyBtn.disabled = !keys.length;
+  };
+  const onEdit = (key) => {
+    const dr = loadConsDraft(loc);
+    const inp = card.querySelector(`input[data-k="${key}"]`);
+    const sel = card.querySelector(`select[data-open="${key}"]`);
+    const entry = {};
+    if(inp && inp.value !== '') entry.n = Math.max(0, parseFloat(inp.value) || 0);
+    if(sel && sel.value !== '__same') entry.open = sel.value;
+    if(Object.keys(entry).length) dr[key] = entry; else delete dr[key];
+    saveConsDraft(loc, dr);
+    const cell = card.querySelector('#ccd-' + key.replace(':', '-'));
+    if(cell) cell.textContent = countDiffText(byKey[key], entry);
+    refreshSummary();
+  };
+  setTimeout(() => {
+    card.querySelector('#cc-loc').onchange = (e) => { State.countLoc = e.target.value; render(); };
+    card.querySelectorAll('input[data-k]').forEach(i => i.oninput = () => onEdit(i.dataset.k));
+    card.querySelectorAll('select[data-open]').forEach(sl => sl.onchange = () => onEdit(sl.dataset.open));
+    refreshSummary();
+  });
+  refreshSummary();
+  return wrap;
+}
+async function applyConsCount(){
+  const loc = countLoc();
+  const draft = loadConsDraft(loc);
+  const rows = Object.fromEntries(countRows(loc).map(r => [r.key, r]));
+  const keys = Object.keys(draft).filter(k => rows[k]);
+  if(!keys.length) return;
+  if(!confirm(`Apply the count for ${keys.length} item(s) at ${loc}? Anything different will be set to the counted figure.`)) return;
+  const changes = [];
+  for(const k of keys){
+    const row = rows[k], d = draft[k];
+    if(row.kind === 'item'){
+      const item = State.screwItems[row.id];
+      if(d.n !== undefined && d.n !== row.sys){
+        const q = { ...(item.qtyByLocation || {}) }; q[loc] = Math.round(d.n);
+        await dbRef('screwItems/' + row.id + '/qtyByLocation').set(q);
+        item.qtyByLocation = q;
+        changes.push({ label: row.label, unit: row.unit, before: row.sys, after: Math.round(d.n) });
+      }
+      if(row.isRoll && d.open !== undefined && d.open !== row.sysOpen){
+        const o = { ...(item.openRollByLocation || {}) };
+        if(d.open) o[loc] = d.open; else delete o[loc];
+        await dbRef('screwItems/' + row.id + '/openRollByLocation').set(Object.keys(o).length ? o : null);
+        item.openRollByLocation = o;
+        changes.push({ label: row.label + ' (open roll)', unit: '', before: row.sysOpen || 'none', after: d.open || 'none' });
+      }
+      checkReorder('screw', row.id, row.label, stockAmount(item), item.reorderQty, item.reorderSent, item.supplierId);
+    } else if(d.n !== undefined && d.n !== row.sys){
+      const t = State.consumableTypes[row.id];
+      const v = { ...(t.volumeByLocation || {}) }; v[loc] = Math.round(d.n * 1000);
+      await dbRef('consumableTypes/' + row.id + '/volumeByLocation').set(v);
+      t.volumeByLocation = v;
+      checkReorder('consumable', row.id, t.name, totalVolumeMl(t), t.reorderLevelMl, t.reorderSent, t.supplierId, true);
+      changes.push({ label: row.label, unit: 'L', before: row.sys, after: d.n });
+    }
+  }
+  await dbRef('countLog/' + uid()).set({ ts: new Date().toISOString(), user: currentUsername(), location: loc, counted: keys.length, changes });
+  saveConsDraft(loc, {});
+  toast(changes.length ? `Count applied — ${changes.length} correction(s) at ${loc}` : `Count applied — everything matched at ${loc}`, 'ok');
+  render();
 }
 
 /* ---------- Consumables Tab (thinners / terps / wood stopping) ---------- */
@@ -967,7 +1459,7 @@ function renderLiquidCard(tid, type){
   const card = el('div','card');
   const head = el('div','');
   head.innerHTML = `
-    <h2>${escapeHtml(type.name)} <span class="pill" style="margin-left:8px;background:#2b4a5e;color:#bfe0f5;">💧 Liquid</span> ${low ? '<span class="pill low" style="margin-left:8px">Reorder</span>' : '<span class="pill ok" style="margin-left:8px">OK</span>'}</h2>
+    <h2>${thumbHtml(type.photoUrl)}${escapeHtml(type.name)} <span class="pill" style="margin-left:8px;background:#2b4a5e;color:#bfe0f5;">💧 Liquid</span> ${low ? '<span class="pill low" style="margin-left:8px">Reorder</span>' : '<span class="pill ok" style="margin-left:8px">OK</span>'}</h2>
     <div class="sub">${mlToLabel(totalMl)} on hand · reorder at ${mlToLabel(reorderMl)}${supplierName ? ' · supplier: ' + escapeHtml(supplierName) : ''}</div>
   `;
   card.appendChild(head);
@@ -1000,18 +1492,8 @@ function renderLiquidCard(tid, type){
 function openUseLiquidModal(tid){
   const type = State.consumableTypes[tid];
   const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
-  const people = Object.entries(State.people || {}).sort((a,b)=> a[1].name.localeCompare(b[1].name));
-  const peopleOpts = people.map(([pid,p])=> `<option value="${pid}">${escapeHtml(p.name)}</option>`).join('');
   openModal('Use ' + type.name, `
-    <label>Person</label>
-    <select id="m-person">
-      <option value="__new">+ New person…</option>
-      ${peopleOpts}
-    </select>
-    <div id="m-newname-wrap" style="display:none">
-      <label>New person's name</label>
-      <input type="text" id="m-newname">
-    </div>
+    ${allocationSelectHtml()}
     ${locationSelectHtml('m-loc', null)}
     <div class="row2">
       <div><label>Amount used (ml)</label><input type="number" id="m-ml" value="${DEFAULT_USE_ML}" min="1" step="50"></div>
@@ -1022,10 +1504,11 @@ function openUseLiquidModal(tid){
     const ml = parseInt(document.getElementById('m-ml').value) || 0;
     const date = document.getElementById('m-date').value || todayStr();
     const location = document.getElementById('m-loc').value;
-    let personSel = document.getElementById('m-person').value;
     if(ml <= 0){ toast('Enter a positive amount', 'err'); return false; }
     const here = volumeAt(type, location);
     if(ml > here){ if(!confirm('That is more than the ' + mlToLabel(here) + ' on hand at ' + location + '. Continue anyway?')) return false; }
+    const alloc = resolveAllocation();
+    if(!alloc) return false;
 
     const finishPersonId = (personId)=>{
       if(!type.volumeByLocation) type.volumeByLocation = {};
@@ -1033,28 +1516,15 @@ function openUseLiquidModal(tid){
       dbRef('consumableTypes/' + tid + '/volumeByLocation').set(type.volumeByLocation);
       checkReorder('consumable', tid, type.name, totalVolumeMl(type), type.reorderLevelMl, type.reorderSent, type.supplierId, true);
       dbRef('transactions/' + uid()).set({
-        personId, itemType:'consumable', itemId:tid, itemLabel: type.name + ' (' + ml + 'ml)', qty: ml, date, month: monthKey(date)
+        personId, itemType:'consumable', itemId:tid, itemLabel: type.name + ' (' + ml + 'ml)', qty: ml, date, month: monthKey(date),
+        recipientType: alloc.recipientType, recipientName: alloc.recipientName, handedOutBy: currentUsername(), location
       });
-      toast('Logged ' + ml + 'ml of ' + type.name + ' used', 'ok');
+      toast('Logged ' + ml + 'ml of ' + type.name + ' → ' + alloc.recipientName, 'ok');
     };
-
-    if(personSel === '__new'){
-      const newName = document.getElementById('m-newname').value.trim();
-      if(!newName){ toast("Enter the new person's name", 'err'); return false; }
-      const newId = uid();
-      dbRef('people/' + newId).set({ name: newName });
-      finishPersonId(newId);
-    } else {
-      finishPersonId(personSel);
-    }
+    finishPersonId(alloc.personId);
     return true;
   });
-  setTimeout(()=>{
-    const sel = document.getElementById('m-person');
-    if(sel) sel.onchange = ()=>{
-      document.getElementById('m-newname-wrap').style.display = sel.value === '__new' ? 'block' : 'none';
-    };
-  });
+  setTimeout(wireAllocationSelect);
 }
 
 function openRestockLiquidModal(tid){
@@ -1079,6 +1549,7 @@ function openRestockLiquidModal(tid){
 
 function renderConsumablesTab(){
   const container = el('div','');
+  container.appendChild(renderCountedCard('consumables')); // stain tins (500 ml / 1 L)
   const types = Object.entries(State.consumableTypes || {}).sort((a,b)=> a[1].name.localeCompare(b[1].name));
 
   types.forEach(([tid, type])=>{
@@ -1188,11 +1659,11 @@ function renderConsumablesTab(){
 
   if(can('consManageItems')){
     const addCard = el('div','card');
-    addCard.innerHTML = `<h2>Add a new item type</h2><div class="sub">For thinners, terps, wood stopping on rags, or anything else tracked by container fill level.</div>`;
+    addCard.innerHTML = `<h2>Add a liquid tracked by volume</h2><div class="sub">For thinners, turps, glue — anything used from a drum and tracked in litres. Stains in 500 ml / 1 L tins go in the Tins list above.</div>`;
     const addRow = el('div','btn-row');
     const addBtn = document.createElement('button');
     addBtn.className = 'btn btn-amber';
-    addBtn.textContent = '+ Add item type';
+    addBtn.textContent = '+ Add liquid';
     addBtn.onclick = openAddConsumableTypeModal;
     addRow.appendChild(addBtn);
     addCard.appendChild(addRow);
@@ -1213,13 +1684,15 @@ function categorySelectHtml(id, selected){
   // to every consumable type regardless of category; this just labels
   // liquid items (thinners, glue, etc.) consistently so they show the
   // same 💧 tag wherever they appear.
-  const CATEGORIES = [['liquid','💧 Liquid (thinners, glue, etc.)'], ['stopping','Wood stopping'], ['other','Other']];
+  // Wood stopping / other moved to the Consumables tab as 'each' items (2026-09-24).
+  const CATEGORIES = [['liquid','💧 Liquid (thinners, turps, glue, etc.)']];
+  if(selected && selected !== 'liquid') CATEGORIES.push([selected, selected === 'stopping' ? 'Wood stopping (old)' : 'Other (old)']);
   return `<label>Category</label><select id="${id}">${CATEGORIES.map(([v,l])=>`<option value="${v}" ${v===selected?'selected':''}>${l}</option>`).join('')}</select>`;
 }
 
 function openAddConsumableTypeModal(){
   openModal('Add item type', `
-    <label>Name (e.g. Thinners, Contact Adhesive, Wood Stopping)</label>
+    <label>Name (e.g. Thinners, Turps, Contact Adhesive)</label>
     <input type="text" id="m-name">
     ${categorySelectHtml('m-category', 'liquid')}
     <div id="m-reorder-container">
@@ -1264,9 +1737,13 @@ function openEditConsumableTypeModal(tid){
       <input type="number" id="m-reorder" value="${isLiquid ? (type.reorderLevelMl||0)/1000 : type.reorderQty}" step="${isLiquid?'0.1':'1'}">
     </div>
     ${supplierSelectHtml('m-supplier', type.supplierId)}
+    ${photoFieldHtml(type.photoUrl)}
     <div class="btn-row"><button class="btn btn-danger" id="m-delete" type="button">Delete this item type</button></div>
   `, ()=>{
     const name = document.getElementById('m-name').value.trim();
+    const photo = readPhotoField();
+    if(photo.file) uploadItemPhoto('consumableTypes', tid, photo.file);
+    else if(photo.remove) dbRef('consumableTypes/' + tid + '/photoUrl').set(null);
     const category = document.getElementById('m-category').value;
     const reorderVal = parseFloat(document.getElementById('m-reorder').value) || 0;
     const supplierId = document.getElementById('m-supplier').value || null;
@@ -1301,11 +1778,13 @@ function openEditConsumableTypeModal(tid){
 /* ---------- People Tab ---------- */
 function renderPeopleTab(){
   const container = el('div','');
-  const people = Object.entries(State.people || {}).sort((a,b)=> a[1].name.localeCompare(b[1].name));
+  // Team members / people first, then sites, then Head office.
+  const kindOrder = k => ({ site: 1, headoffice: 2 })[k] || 0;
+  const people = Object.entries(State.people || {}).sort((a,b)=> (kindOrder(a[1].kind) - kindOrder(b[1].kind)) || a[1].name.localeCompare(b[1].name));
 
   if(people.length === 0){
     const card = el('div','card');
-    card.appendChild(elHtml('div','empty','No people added yet. People are added automatically the first time you hand something out to them.'));
+    card.appendChild(elHtml('div','empty','Nothing allocated yet. Everyone you hand stock to (team members, sites, Head office) shows up here automatically.'));
     container.appendChild(card);
   }
 
@@ -1320,7 +1799,8 @@ function renderPeopleTab(){
 
     const card = el('div','card');
     const head = el('div','');
-    head.innerHTML = `<h2>${escapeHtml(person.name)}</h2><div class="sub">${txns.length} item(s) taken all-time</div>`;
+    const icon = person.kind === 'site' ? '🚚 ' : (person.kind === 'headoffice' ? '🏢 ' : '');
+    head.innerHTML = `<h2>${icon}${escapeHtml(person.name)}</h2><div class="sub">${txns.length} item(s) allocated all-time</div>`;
     card.appendChild(head);
 
     if(months.length === 0){
@@ -1336,11 +1816,11 @@ function renderPeopleTab(){
         details.appendChild(summary);
         const body = el('div','body');
         const table = document.createElement('table');
-        table.innerHTML = `<thead><tr><th>Date</th><th>Item</th><th>Qty</th></tr></thead>`;
+        table.innerHTML = `<thead><tr><th>Date</th><th>Item</th><th>Qty</th><th>Handed out by</th></tr></thead>`;
         const tbody = document.createElement('tbody');
         list.sort((a,b)=> a.date.localeCompare(b.date)).forEach(t=>{
           const tr = document.createElement('tr');
-          tr.innerHTML = `<td>${t.date}</td><td>${escapeHtml(t.itemLabel)}</td><td class="num">${t.qty}</td>`;
+          tr.innerHTML = `<td>${t.date}</td><td>${escapeHtml(t.itemLabel)}</td><td class="num">${t.qty}</td><td>${escapeHtml(t.handedOutBy || '—')}</td>`;
           tbody.appendChild(tr);
         });
         table.appendChild(tbody);
@@ -1433,14 +1913,14 @@ function renderReportsTab(){
   if(!can('consViewReports')) return container;
   const stockCard = el('div','card');
   stockCard.innerHTML = `<h2>Items at or below reorder level</h2>`;
-  const lowScrews = Object.values(State.screwItems||{}).filter(i=> totalScrewQty(i) <= i.reorderQty);
+  const lowScrews = Object.values(State.screwItems||{}).filter(i=> stockAmount(i) <= i.reorderQty);
   const lowConsList = Object.entries(State.consumableTypes||{}).filter(([tid,t])=> isConsumableTypeLow(tid, t));
   if(lowScrews.length===0 && lowConsList.length===0){
     stockCard.appendChild(elHtml('div','empty','Nothing currently needs reordering.'));
   } else {
     const ul = document.createElement('ul');
     ul.style.margin = '0'; ul.style.paddingLeft = '18px'; ul.style.fontSize='13.5px';
-    lowScrews.forEach(i=>{ const li=document.createElement('li'); li.textContent = `${i.size} — ${totalScrewQty(i)} bundle(s) left`; ul.appendChild(li); });
+    lowScrews.forEach(i=>{ const li=document.createElement('li'); li.textContent = `${itemName(i)} — ${stockTotalLabel(i)} ${unitWord(i)} left`; ul.appendChild(li); });
     lowConsList.forEach(([tid,t])=>{
       const li=document.createElement('li');
       li.textContent = t.category === 'liquid'
@@ -1472,15 +1952,15 @@ function buildStockPdfBlob(){
   doc.text('Generated ' + new Date().toLocaleString(), 14, 24);
 
   let y = 32;
-  const screws = Object.values(State.screwItems || {}).sort((a,b)=> a.size.localeCompare(b.size, undefined, {numeric:true}));
+  const screws = Object.values(State.screwItems || {}).sort((a,b)=> itemName(a).localeCompare(itemName(b), undefined, {numeric:true}));
   if(screws.length > 0){
     const rows = screws.map(item => {
-      const breakdown = locations.map(l => `${l}: ${screwQtyAt(item,l)}`).join('  ·  ');
-      return [item.size, item.bundleSize, breakdown, totalScrewQty(item), item.reorderQty];
+      const breakdown = locations.map(l => `${l}: ${stockAtLabel(item,l)}`).join('  ·  ');
+      return [itemName(item), unitLabel(item), breakdown, stockTotalLabel(item), item.reorderQty];
     });
     doc.autoTable({
       startY: y,
-      head: [['Screws', 'Bundle size', 'By location', 'Total (bundles)', 'Reorder at']],
+      head: [['Consumables & tins', 'Unit', 'By location', 'Total', 'Reorder at']],
       body: rows,
       styles: { fontSize: 8, cellPadding: 2 },
       headStyles: { fillColor: [184, 121, 31] },
@@ -1546,10 +2026,13 @@ function exportToExcel(personSel, monthSel){
   const rows = txns.sort((a,b)=> a.date.localeCompare(b.date)).map(t=>({
     Date: t.date,
     Month: monthLabel(t.month),
-    Person: (State.people[t.personId] && State.people[t.personId].name) || 'Unknown',
+    'Allocated to': t.recipientName || (State.people[t.personId] && State.people[t.personId].name) || 'Unknown',
+    'Allocation type': ({ user: 'Team member', person: 'Person', site: 'Sent to site', headoffice: 'Head office' })[t.recipientType] || 'Person',
+    'Handed out by': t.handedOutBy || '',
     Item: t.itemLabel,
-    Type: t.itemType === 'screw' ? 'Screws' : 'Consumable',
-    Qty: t.qty
+    Type: t.itemType === 'screw' ? (t.category || (State.screwItems[t.itemId] ? itemCategory(State.screwItems[t.itemId]) : 'Consumables')) : 'Liquid',
+    Qty: t.qty,
+    Unit: t.itemType === 'screw' ? (ITEM_UNITS[t.unit] ? ITEM_UNITS[t.unit].word : 'bundle(s)') : 'ml'
   }));
 
   if(rows.length === 0){ toast('Nothing to export for that selection', 'err'); return; }
@@ -1574,7 +2057,7 @@ function exportToExcel(personSel, monthSel){
    deduct for those the way there is for screw bundles or liquid ml. ---------------- */
 function renderSendToDispatchTab(){
   const wrap = el('div','');
-  const screws = Object.entries(State.screwItems||{}).sort((a,b)=> a[1].size.localeCompare(b[1].size, undefined, {numeric:true}));
+  const screws = Object.entries(State.screwItems||{}).sort((a,b)=> itemName(a[1]).localeCompare(itemName(b[1]), undefined, {numeric:true}));
   const liquids = Object.entries(State.consumableTypes||{}).filter(([tid,t])=> t.category==='liquid').sort((a,b)=> a[1].name.localeCompare(b[1].name));
   const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
 
@@ -1585,13 +2068,13 @@ function renderSendToDispatchTab(){
   kindWrap.innerHTML = `
     <label>Type</label>
     <select id="sd-kind">
-      <option value="screw">Screws</option>
-      <option value="liquid">Liquid</option>
+      <option value="screw">Consumables & tins</option>
+      <option value="liquid">Liquid (by volume)</option>
     </select>
     <label>Location</label>
     <select id="sd-loc">${locations.map(l=>`<option value="${escapeHtml(l)}">${escapeHtml(l)}</option>`).join('')}</select>
     <div id="sd-item-wrap"></div>
-    <label id="sd-qty-label">Quantity (bundles)</label>
+    <label id="sd-qty-label">Quantity</label>
     <input type="number" id="sd-qty" value="1" min="1">
     <label>Reference / job</label>
     <input type="text" id="sd-ref" placeholder="e.g. NH Hotel">
@@ -1604,8 +2087,10 @@ function renderSendToDispatchTab(){
     const kind = document.getElementById('sd-kind').value;
     const itemWrap = document.getElementById('sd-item-wrap');
     if(kind === 'screw'){
-      itemWrap.innerHTML = `<label>Screw size</label><select id="sd-item">${screws.map(([id,s])=>`<option value="${id}">${escapeHtml(s.size)} (on hand: ${totalScrewQty(s)})</option>`).join('') || '<option value="">No screw sizes yet</option>'}</select>`;
-      document.getElementById('sd-qty-label').textContent = 'Quantity (bundles)';
+      itemWrap.innerHTML = `<label>Item</label><select id="sd-item">${screws.map(([id,s])=>`<option value="${id}">${escapeHtml(itemName(s))} (on hand: ${escapeHtml(stockTotalLabel(s))} ${unitWord(s)})</option>`).join('') || '<option value="">No items yet</option>'}</select>`;
+      const setQtyLabel = ()=>{ const it = State.screwItems[document.getElementById('sd-item').value]; document.getElementById('sd-qty-label').textContent = 'Quantity (' + (it ? unitWord(it) : 'bundles') + ')'; };
+      document.getElementById('sd-item').onchange = setQtyLabel;
+      setQtyLabel();
     } else {
       itemWrap.innerHTML = `<label>Liquid</label><select id="sd-item">${liquids.map(([id,t])=>`<option value="${id}">${escapeHtml(t.name)} (on hand: ${mlToLabel(totalVolumeMl(t))})</option>`).join('') || '<option value="">No liquids yet</option>'}</select>`;
       document.getElementById('sd-qty-label').textContent = 'Quantity (ml)';
@@ -1634,14 +2119,14 @@ async function submitSendToDispatch(){
   let label, here, deductRef, deductObjKey;
   if(kind === 'screw'){
     const item = State.screwItems[itemId];
-    if(!item){ toast('That screw size no longer exists', 'err'); return; }
-    label = item.size;
+    if(!item){ toast('That item no longer exists', 'err'); return; }
+    label = itemName(item);
     here = screwQtyAt(item, location);
-    if(qty > here && !confirm(`Only ${here} bundle(s) on hand at ${location} — send anyway? Stock will show as negative there.`)) return;
+    if(qty > here && !confirm(`Only ${here} ${unitWord(item)} on hand at ${location} — send anyway? Stock will show as negative there.`)) return;
     if(!item.qtyByLocation) item.qtyByLocation = {};
     item.qtyByLocation[location] = here - qty;
     await dbRef('screwItems/' + itemId + '/qtyByLocation').set(item.qtyByLocation);
-    checkReorder('screw', itemId, label, totalScrewQty(item), item.reorderQty, item.reorderSent, item.supplierId);
+    checkReorder('screw', itemId, label, stockAmount(item), item.reorderQty, item.reorderSent, item.supplierId);
   } else {
     const type = State.consumableTypes[itemId];
     if(!type){ toast('That liquid no longer exists', 'err'); return; }
@@ -1659,7 +2144,7 @@ async function submitSendToDispatch(){
     // wipe out a Dispatch change someone else saved in the same moment.
     const today = new Date().toLocaleDateString('en-GB', {day:'2-digit', month:'long', year:'numeric'});
     const newItem = {
-      id: uid(), type: label + (kind==='liquid' ? ' (' + qty + 'ml)' : ''), qty, ref,
+      id: uid(), type: label + (kind==='liquid' ? ' (' + qty + 'ml)' : (' (' + unitWord(State.screwItems[itemId] || {}) + ')')), qty, ref,
       status: 'unvinaged',
       addedDate: today, vinagedDate: null, readyDate: null, dispatchedDate: null, noteId: null,
       recipeSnapshot: [{ sourceApp: 'consumablesStock', kind, itemId, desc: label, deductQty: qty, location }]
@@ -1693,7 +2178,7 @@ function renderSuppliersTab(){
     suppliers.forEach(([sid, s])=>{
       const screwCount = Object.values(State.screwItems||{}).filter(i=> i.supplierId===sid).length;
       const consCount = Object.values(State.consumableTypes||{}).filter(t=> t.supplierId===sid).length;
-      const lowCount = Object.values(State.screwItems||{}).filter(i=> i.supplierId===sid && totalScrewQty(i)<=i.reorderQty).length +
+      const lowCount = Object.values(State.screwItems||{}).filter(i=> i.supplierId===sid && stockAmount(i)<=i.reorderQty).length +
         Object.entries(State.consumableTypes||{}).filter(([tid,t])=> t.supplierId===sid && isConsumableTypeLow(tid, t)).length;
       const tr = document.createElement('tr');
       tr.innerHTML = `
@@ -1829,7 +2314,7 @@ function renderAdminTab(){
   if(State.currentUser.isRoot){
     const locCard = el('div','card');
     const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
-    locCard.innerHTML = `<h2>Locations</h2><div class="sub">Where screws and consumable containers are physically kept — each shows as its own section on Screws/Consumables.</div>`;
+    locCard.innerHTML = `<h2>Locations</h2><div class="sub">Where screws and consumable containers are physically kept — each shows as its own section on the Consumables and Liquid tabs.</div>`;
     const locList = el('div','stack');
     locations.forEach((l, i) => {
       const row = el('div','user-row');
