@@ -759,7 +759,7 @@ const ITEM_CATEGORIES = [
   'Screws & fasteners', 'Knock-down fittings', 'Hinges & hinge plates', 'Drawer runners',
   'Handles, knobs & legs', 'Brackets, stays & supports', 'Locks & catches', 'Edging',
   'Adhesives & sealants', 'Fillers & stopping', 'Abrasives', 'Packaging & protection',
-  'Workshop & PPE', 'Stains & finishes', 'Other'
+  'PPE (safety gear)', 'Workshop & PPE', 'Stains & finishes', 'Other'
 ];
 const DEFAULT_CATEGORY = { per500: 'Screws & fasteners', each: 'Other', pair: 'Drawer runners', roll: 'Packaging & protection', tin: 'Stains & finishes' };
 // Size suggestions (free text is allowed too) — the common ones for each unit.
@@ -1059,12 +1059,15 @@ function openAddScrewModal(defaultUnit){
 
 function openEditScrewModal(id){
   const item = State.screwItems[id];
+  const editLocations = (State.locations && State.locations.length) ? State.locations : ['Main'];
   const isTin = itemUnit(item) === 'tin';
   openModal('Edit ' + itemName(item), `
     <label>Name</label>
     <input type="text" id="m-size" value="${escapeHtml(item.size)}">
     ${unitFieldsHtml(item, isTin)}
     <label>Reorder at (<span class="m-unitword"></span>)</label><input type="number" id="m-reorder" value="${item.reorderQty}">
+    ${currentUserIsRoot() ? `<label>Stock on hand (<span class="m-unitword"></span>) — root only, logged as a stock correction</label>
+      <div class="row2">${editLocations.map((l,i)=>`<div><label style="margin-top:0;font-weight:400">${escapeHtml(l)}</label><input type="number" min="0" step="1" id="m-qty-${i}" value="${screwQtyAt(item, l)}"></div>`).join('')}</div>` : ''}
     ${supplierSelectHtml('m-supplier', item.supplierId)}
     ${photoFieldHtml(item.photoUrl)}
     <div class="btn-row"><button class="btn btn-danger" id="m-delete" type="button">Delete this item</button></div>
@@ -1078,6 +1081,23 @@ function openEditScrewModal(id){
     const upd = { size, unit: u.unit, category: u.category, reorderQty, supplierId, bundleSize: u.bundleSize || null, packSize: u.packSize || null };
     if(u.unit !== 'roll') upd.openRollByLocation = null;
     if(photo.remove && !photo.file) upd.photoUrl = null;
+    // Root: correct the stock on hand per location (logged like a stock count).
+    if(currentUserIsRoot()){
+      const q = Object.assign({}, item.qtyByLocation || {});
+      const changes = [];
+      editLocations.forEach((l, i) => {
+        const el = document.getElementById('m-qty-' + i);
+        if(!el || el.value === '') return;
+        const n = Math.max(0, Math.round(Number(el.value) || 0));
+        const before = screwQtyAt(item, l);
+        if(n !== before){ q[l] = n; changes.push({ label: size + ' (' + l + ')', unit: unitWord({ ...item, ...upd }), before, after: n }); }
+      });
+      if(changes.length){
+        upd.qtyByLocation = q;
+        if(typeof item.qtyBundles === 'number') upd.qtyBundles = null;
+        dbRef('countLog/' + uid()).set({ ts: new Date().toISOString(), user: currentUsername(), location: 'Edit (stock correction)', counted: changes.length, changes });
+      }
+    }
     dbRef('screwItems/' + id).update(upd);
     if(photo.file) uploadItemPhoto('screwItems', id, photo.file);
     checkReorder('screw', id, size, stockAmount({ ...item, ...upd }), reorderQty, item.reorderSent, supplierId);
@@ -1752,6 +1772,7 @@ function openAddConsumableTypeModal(){
 function openEditConsumableTypeModal(tid){
   const type = State.consumableTypes[tid];
   const isLiquid = type.category === 'liquid';
+  const editLocs = (State.locations && State.locations.length) ? State.locations : ['Main'];
   openModal('Edit ' + type.name, `
     <label>Name</label>
     <input type="text" id="m-name" value="${escapeHtml(type.name)}">
@@ -1760,6 +1781,8 @@ function openEditConsumableTypeModal(tid){
       <label id="m-reorder-label">${isLiquid ? 'Reorder level (liters)' : 'Reorder at (active containers)'}</label>
       <input type="number" id="m-reorder" value="${isLiquid ? (type.reorderLevelMl||0)/1000 : type.reorderQty}" step="${isLiquid?'0.1':'1'}">
     </div>
+    ${currentUserIsRoot() && isLiquid ? `<label>Stock on hand (liters) — root only, logged as a stock correction</label>
+      <div class="row2">${editLocs.map((l,i)=>`<div><label style="margin-top:0;font-weight:400">${escapeHtml(l)}</label><input type="number" min="0" step="0.1" id="m-vol-${i}" value="${Math.round(((type.volumeByLocation||{})[l]||0)/100)/10}"></div>`).join('')}</div>` : ''}
     ${supplierSelectHtml('m-supplier', type.supplierId)}
     ${photoFieldHtml(type.photoUrl)}
     <div class="btn-row"><button class="btn btn-danger" id="m-delete" type="button">Delete this item type</button></div>
@@ -1773,8 +1796,20 @@ function openEditConsumableTypeModal(tid){
     const supplierId = document.getElementById('m-supplier').value || null;
     if(!name){ toast('Enter a name', 'err'); return false; }
     if(category === 'liquid'){
-      dbRef('consumableTypes/' + tid).update({ name, category, supplierId, reorderLevelMl: Math.round(reorderVal*1000), volumeByLocation: type.volumeByLocation || {} });
-      checkReorder('consumable', tid, name, totalVolumeMl(type), Math.round(reorderVal*1000), type.reorderSent, supplierId, true);
+      const vol = Object.assign({}, type.volumeByLocation || {});
+      const changes = [];
+      if(currentUserIsRoot() && isLiquid){
+        editLocs.forEach((l, i) => {
+          const el = document.getElementById('m-vol-' + i);
+          if(!el || el.value === '') return;
+          const ml = Math.max(0, Math.round((Number(el.value) || 0) * 1000));
+          const before = vol[l] || 0;
+          if(ml !== before){ vol[l] = ml; changes.push({ label: name + ' (' + l + ')', unit: 'litres', before: before/1000, after: ml/1000 }); }
+        });
+        if(changes.length) dbRef('countLog/' + uid()).set({ ts: new Date().toISOString(), user: currentUsername(), location: 'Edit (stock correction)', counted: changes.length, changes });
+      }
+      dbRef('consumableTypes/' + tid).update({ name, category, supplierId, reorderLevelMl: Math.round(reorderVal*1000), volumeByLocation: vol });
+      checkReorder('consumable', tid, name, Object.values(vol).reduce((a,b)=>a+(Number(b)||0),0), Math.round(reorderVal*1000), type.reorderSent, supplierId, true);
     } else {
       dbRef('consumableTypes/' + tid).update({ name, category, supplierId, reorderQty: Math.round(reorderVal) });
       checkReorder('consumable', tid, name, (Object.values(State.consumableUnits||{}).filter(u=>u.typeId===tid && u.fillLevel!=='Finished').length), Math.round(reorderVal), type.reorderSent, supplierId);
