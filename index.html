@@ -4,85 +4,23 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
 <title>Fixings &amp; Finishing Stock</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
-<link rel="manifest" href="manifest.json">
-<link rel="icon" href="icon-192.png" type="image/png">
-<link rel="apple-touch-icon" href="icon-180.png">
-<meta name="theme-color" content="#1E1C18">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Consumables">
 
 <!--
   CLAUDE DEV NOTES (keep this updated across sessions)
   =====================================================
   App: Screws / Thinners / Wood Stopping stock tracker for Oak Joinery (Pty) Ltd.
   Third app in the family, alongside board-stock-app and oak-joinery-stock-board.
-  SHARED Firebase Realtime Database project with the Dispatch/Stock List/Board Stock
-  apps (migrated 2026-09-11) — see SHARED AUTH further down. This app's own data
-  below stays at its own DB_PATH, untouched by that; only users[] is shared.
+  Own separate Firebase Realtime Database project (do not share with the other two apps).
 
   DATA MODEL (Firebase Realtime Database, root path configurable via CONFIG.DB_PATH):
-    /screwItems/{id}       -> { size, bundleSize, qtyByLocation:{locationName:number}, reorderQty, reorderSent(bool) }
-    /consumableTypes/{id}  -> { name, category ('liquid'|'stopping'|'other'), reorderQty, reorderSent(bool) }
-    /consumableUnits/{id}  -> { typeId, fillLevel ('Full'|'3/4'|'1/2'|'1/4'|'Finished'), createdDate, location }
+    /users/{userId}        -> { username, pin, isRoot, perms:{manageUsers,manageItems,handOut,manageConsumables,viewReports,exportExcel} }
+    /screwItems/{id}       -> { size, bundleSize, qtyBundles, reorderQty, reorderSent(bool) }
+    /consumableTypes/{id}  -> { name, category ('thinner'|'stopping'|'other'), reorderQty, reorderSent(bool) }
+    /consumableUnits/{id}  -> { typeId, fillLevel ('Full'|'3/4'|'1/2'|'1/4'|'Finished'), createdDate }
     /people/{id}           -> { name }
     /transactions/{id}     -> { personId, itemType('screw'|'consumable'), itemId, itemLabel, qty, date (YYYY-MM-DD), month (YYYY-MM) }
     /suppliers/{id}        -> { name, email }
-    /meta                  -> { reorderEmail, emailjsServiceId, emailjsTemplateId, emailjsPublicKey, locations:["Main",...] }
-
-  LOCATIONS (added 2026-09-21, per user request: "i want the same in
-  consumables" — mirrors board-stock-app's locations feature). Root-managed
-  fixed list at meta.locations (Admin tab). Screw items: qtyBundles ->
-  qtyByLocation, same object-keyed-by-location pattern as board-stock-app's
-  board.qty; migrateLegacyScrewQty() converts any item still on the old
-  plain-number shape the first time it's seen. Consumable units are simpler
-  since each one already IS a single physical container — just gained a
-  `location` field, and the Consumables tab groups each type's containers
-  into per-location sub-sections. A unit with no location (predates this
-  change) is shown under the first location in the list.
-
-  LIQUID VOLUME TRACKING (added 2026-09-22, per user request: "change
-  the liquid to 750ml each time it gets used...restock level of 20L").
-  Liquid-category types no longer use consumableUnits/fill-level at all
-  — replaced by volumeByLocation (ml, per location, same pattern as
-  screwItems.qtyByLocation) and reorderLevelMl (a single ml threshold,
-  e.g. 20000 for "20L"). renderLiquidCard() is a completely separate
-  render path from the fill-level card non-liquid types still use.
-  openUseLiquidModal() mirrors openHandOutModal() for screws — same
-  person-picker pattern, default 750ml (DEFAULT_USE_ML), adjustable.
-  openRestockLiquidModal() takes liters and converts to ml. Existing
-  consumableUnits for a type that gets switched to 'liquid' are left
-  alone (not deleted, not migrated — there's no reliable way to convert
-  fill-level fractions into an absolute ml figure without knowing each
-  container's size), they simply stop being shown once the type is
-  liquid. consumableTypeQty()/consumableTypeReorderLevel()/
-  isConsumableTypeLow() are the one shared branch point every low-stock
-  check (reports, supplier low-count, manual reorder email) now goes
-  through, instead of five separate copies of the container-count logic.
-
-  SEND TO DISPATCH (added 2026-09-22, per user request: "i want a
-  section off sending from consumables to dispatch as well"): new tab,
-  gated by consSendToDispatch, covers screw bundles AND liquid ml (not
-  fill-level containers — no clean single "qty" to deduct there). Same
-  mechanism as Board Stock Take's own version: deducts stock here,
-  writes a new Unfinished item into the shared 'dispatchBoard/items',
-  recipeSnapshot:[{sourceApp:'consumablesStock', kind:'screw'|'liquid',
-  itemId, desc, deductQty, location}] — kind is what tells Dispatch's
-  returnItemToStock() whether to credit back qtyByLocation or
-  volumeByLocation when reversed.
-
-  LIQUID CATEGORY (added 2026-09-21, per user request: "i want a liquid
-  button so that if or in case thinners work in 1/4 sections glue works
-  the same"): consumableTypes.category was documented but never actually
-  implemented in the add/edit form until now — categorySelectHtml() adds
-  it, with 'liquid' covering thinners/glue/anything tracked the same way.
-  The underlying fill-level (1/4 etc.) tracking already applied to every
-  consumable type regardless of category, so "glue works the same" was
-  already true mechanically; this just labels liquid items consistently
-  (💧 tag) wherever they appear.
+    /emailConfig           -> { serviceId, templateId, publicKey, reorderEmail } (root-only, baked once via setup screen)
 
   Screws and consumable types both carry a `supplierId` (nullable) set from a dropdown on their
   add/edit modals. Reorder emails are bundled per supplier: when an item crosses its reorder
@@ -92,12 +30,11 @@
   supplier is set), CC'd to the supplier's ccEmail if set. Body: "Good day {contact person}," /
   "I hope this email finds you well." / "Please quote me on the following:" / itemised list /
   "Kind regards," + the signature of whichever logged-in user's action triggered the reorder
-  (users/{id}/consEmailSignature, falls back to their username). The Suppliers tab also has a
-  manual "Send reorder email now" per supplier that bypasses the queue for testing/ad-hoc use.
+  (users/{id}/signature, falls back to their username). The Suppliers tab also has a manual
+  "Send reorder email now" per supplier that bypasses the queue for testing/ad-hoc use.
 
-  AUTH: shared with the Dispatch/Stock List/Board Stock apps (see SHARED AUTH further
-  down) — username + PIN (SHA-256 hashed), stored on 'dispatchBoard/users', not this
-  app's own DB_PATH. Root config (Firebase project keys +
+  AUTH: username + 4-digit PIN, stored in DB (not Firebase Auth). Root user manages other users +
+  per-tab permissions, same pattern as board-stock-app. Root config (Firebase project keys +
   EmailJS keys) is entered once via the Setup screen and stored in localStorage on that device
   (mirrors board-stock-app's approach: keys are not pushed to the DB itself, only emailConfig
   routing fields are, since anyone with DB read access could see them otherwise... actually see
@@ -114,31 +51,27 @@
   Database and paste the config into FIREBASE_CONFIG below (see SETUP.md), same as board-stock-app.
 -->
 
-<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-database-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-storage-compat.js"></script>
-<script src="https://seanoakjoinery.github.io/oak-core/oak-core.js?v=2"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 
 <style>
   :root{
-    --bg: #1E1C18;
-    --panel: #26221C;
-    --panel-raised: #2E2A22;
-    --line: #433D32;
-    --text: #EFE8D8;
-    --text-dim: #9C9280;
-    --amber: #E3A23A;
-    --amber-dim: #EEB055;
-    --green: #5FA776;
-    --red: #C1613D;
+    --bg: #16181c;
+    --panel: #1f2227;
+    --panel-raised: #262a30;
+    --line: #34383f;
+    --text: #e8e6e1;
+    --text-dim: #9a9ea6;
+    --amber: #d98e30;
+    --amber-dim: #8a5e22;
+    --green: #6fae63;
+    --red: #c85c4a;
     --blue: #5b8fb0;
     --mono: 'SF Mono', 'Consolas', 'Menlo', monospace;
     --sans: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   }
-  .brand-wordmark{font-size:12px; font-weight:600; letter-spacing:.12em; line-height:1.25; text-align:right; color:var(--text);}
-  .brand-wordmark span{display:block; font-weight:400; font-size:8.5px; letter-spacing:.2em; color:var(--amber);}
   *{box-sizing:border-box;}
   html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:15px;}
   body{padding-bottom:40px;}
@@ -184,7 +117,7 @@
 
   .btn{background:var(--panel-raised);border:1px solid var(--line);color:var(--text);padding:7px 13px;border-radius:7px;font-size:13px;}
   .btn:hover{border-color:var(--amber);}
-  .btn-amber{background:var(--amber);border-color:var(--amber);color:#241a08;font-weight:600;}
+  .btn-amber{background:var(--amber);border-color:var(--amber);color:#1a1a1a;font-weight:600;}
   .btn-amber:hover{background:#e39d47;}
   .btn-ghost{background:none;border:1px solid var(--line);color:var(--text-dim);}
   .btn-danger{background:none;border:1px solid var(--red);color:var(--red);}
@@ -251,38 +184,34 @@
    CONFIG — root fills this in once via the Setup screen (see SETUP.md).
    Baked into localStorage on first run so it doesn't need to live in the DB.
    ========================================================================= */
-// Shared with the Dispatch/Stock List/Board Stock apps — same Firebase
-// project/database (per user request, replacing this app's original
-// paste-your-own-config setup screen). This app's OWN data (screws,
-// consumables, people, transactions, suppliers) still lives at its own
-// DB_PATH below, so it doesn't collide with 'dispatchBoard'/'stockList'/
-// 'boardStock' — only users comes from the shared 'dispatchBoard/users'
-// path (see SHARED AUTH section further down).
-const CONFIG = {
-  FIREBASE_CONFIG: {
-    apiKey: "AIzaSyCkoUkLIlxdxD2AAEpLGW4dzqkSeC5lVh0",
-    authDomain: "oak-joinery-stock-dispatch.firebaseapp.com",
-    databaseURL: "https://oak-joinery-stock-dispatch-default-rtdb.europe-west1.firebasedatabase.app",
-    projectId: "oak-joinery-stock-dispatch",
-    storageBucket: "oak-joinery-stock-dispatch.firebasestorage.app",
-    messagingSenderId: "538461584463",
-    appId: "1:538461584463:web:b84319c125e9bf9a47be3a"
-  },
-  DB_PATH: "consumablesStock",
+const DEFAULT_CONFIG = {
+  FIREBASE_CONFIG: null, // { apiKey, authDomain, databaseURL, projectId, storageBucket, messagingSenderId, appId }
+  DB_PATH: "fixingsStock",
   EMAILJS_PUBLIC_KEY: "",
   EMAILJS_SERVICE_ID: "",
   EMAILJS_TEMPLATE_ID: "",
   REORDER_EMAIL: ""
 };
 
+function loadConfig(){
+  try{
+    const raw = localStorage.getItem('fixingsStockConfig');
+    if(raw) return {...DEFAULT_CONFIG, ...JSON.parse(raw)};
+  }catch(e){}
+  return {...DEFAULT_CONFIG};
+}
+function saveConfig(cfg){
+  localStorage.setItem('fixingsStockConfig', JSON.stringify(cfg));
+}
+let CONFIG = loadConfig();
+
 /* =========================================================================
    STATE
    ========================================================================= */
 const State = {
   db: null,
-  dispatchBoardRef: null,   // still used for dispatchBoard/items (stock→dispatch handoff); users via OakCore
-  sharedUsers: [],          // synced live from dispatchBoard/users
-  currentUser: null, // an entry from sharedUsers: {id, username, pin, isRoot, isMainRoot, apps, permissions}
+  currentUser: null, // {id, username, isRoot, perms}
+  users: {},
   screwItems: {},
   consumableTypes: {},
   consumableUnits: {},
@@ -290,43 +219,11 @@ const State = {
   transactions: {},
   suppliers: {},
   activeTab: 'screws',
-  ready: false,
-  locations: ['Main']
+  ready: false
 };
 
 const FILL_LEVELS = ['Full','3/4','1/2','1/4','Finished'];
-
-// --- LOCATIONS (added 2026-09-21, per user request: "i want the same
-// in consumables" — mirrors board-stock-app's own locations feature
-// exactly, see that app's dev notes for the fuller rationale). Screw
-// items change from a single qtyBundles number to qtyByLocation, an
-// object keyed by location name — same pattern as board.qty there.
-// Consumable units (thinners/glue/stopping containers) get a simpler
-// treatment: each unit already IS one physical container, so it just
-// gets its own `location` field rather than needing a number-object.
-function totalScrewQty(item){
-  if(typeof item.qtyBundles === 'number') return item.qtyBundles; // not yet migrated
-  return Object.values(item.qtyByLocation || {}).reduce((a,b)=>a+(Number(b)||0), 0);
-}
-function screwQtyAt(item, location){
-  if(typeof item.qtyBundles === 'number') return location === (State.locations||['Main'])[0] ? item.qtyBundles : 0;
-  return (item.qtyByLocation && item.qtyByLocation[location]) || 0;
-}
-function migrateLegacyScrewQty(item){
-  if(typeof item.qtyBundles === 'number'){
-    const firstLoc = (State.locations && State.locations[0]) || 'Main';
-    item.qtyByLocation = { [firstLoc]: item.qtyBundles };
-    delete item.qtyBundles;
-    return true; // caller should persist this back
-  }
-  return false;
-}
-// Namespaced ("cons...") per user request to share the SAME users[]/
-// permissions object as the Dispatch, Stock List, and Board Stock apps —
-// unprefixed keys here would clash with similarly-named permissions in
-// those apps. manageUsers is the one exception: it's the same concept
-// (can edit the shared roster) everywhere, so it stays unprefixed.
-const DEFAULT_PERMS = { manageUsers:false, consManageItems:false, consHandOut:true, consManageConsumables:true, consViewReports:true, consExportExcel:true, consSendToDispatch:false };
+const DEFAULT_PERMS = { manageUsers:false, manageItems:false, handOut:true, manageConsumables:true, viewReports:true, exportExcel:true };
 
 function uid(){ return 'id' + Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
 function monthKey(d){ return d.slice(0,7); }
@@ -348,59 +245,28 @@ function toast(msg, type){
 /* =========================================================================
    FIREBASE INIT + SYNC
    ========================================================================= */
-let oak = null;
 function initFirebase(){
+  if(!CONFIG.FIREBASE_CONFIG){ renderSetupScreen(); return; }
   try{
     if(!firebase.apps.length) firebase.initializeApp(CONFIG.FIREBASE_CONFIG);
     State.db = firebase.database();
-    // Still used for dispatchBoard/items (stock→dispatch handoff).
-    // Shared users sync/save now goes through OakCore (see SHARED AUTH).
-    State.dispatchBoardRef = firebase.database().ref('dispatchBoard');
-    if (window.OakCore) {
-      oak = OakCore.createApp({ appId: "consumables", readOnly: false });
-      oak.init();
-    }
   }catch(e){
     toast('Firebase init failed: ' + e.message, 'err');
+    renderSetupScreen();
     return;
   }
   attachListeners();
-  startSharedUsersSync();
 }
 
 function attachListeners(){
   const base = State.db.ref(CONFIG.DB_PATH);
-  base.child('screwItems').on('value', snap => {
-    State.screwItems = snap.val() || {};
-    // Migrate any item still on the OLD single-number qtyBundles the
-    // first time it's seen, and persist that back so it only happens
-    // once per item.
-    Object.entries(State.screwItems).forEach(([id, item]) => {
-      if(migrateLegacyScrewQty(item)) dbRef('screwItems/' + id).set(item);
-    });
-    onDataChange();
-  });
+  base.child('users').on('value', snap => { State.users = snap.val() || {}; onDataChange(); });
+  base.child('screwItems').on('value', snap => { State.screwItems = snap.val() || {}; onDataChange(); });
   base.child('consumableTypes').on('value', snap => { State.consumableTypes = snap.val() || {}; onDataChange(); });
   base.child('consumableUnits').on('value', snap => { State.consumableUnits = snap.val() || {}; onDataChange(); });
   base.child('people').on('value', snap => { State.people = snap.val() || {}; onDataChange(); });
   base.child('transactions').on('value', snap => { State.transactions = snap.val() || {}; onDataChange(); });
   base.child('suppliers').on('value', snap => { State.suppliers = snap.val() || {}; onDataChange(); });
-  base.child('countLog').limitToLast(20).on('value', snap => { State.countLog = snap.val() || {}; onDataChange(); });
-  base.child('meta').on('value', snap => {
-    const m = snap.val() || {};
-    CONFIG.REORDER_EMAIL = m.reorderEmail || '';
-    CONFIG.EMAILJS_SERVICE_ID = m.emailjsServiceId || '';
-    CONFIG.EMAILJS_TEMPLATE_ID = m.emailjsTemplateId || '';
-    CONFIG.EMAILJS_PUBLIC_KEY = m.emailjsPublicKey || '';
-    // Root-managed fixed list, per user request ("i want the same in
-    // consumables" — mirrors board-stock-app's own locations feature).
-    // "Main" default keeps existing screw/consumable-unit records
-    // (which predate this and have no location field/key yet) showing
-    // up somewhere sensible rather than vanishing from view.
-    State.locations = (Array.isArray(m.locations) && m.locations.length) ? m.locations : ['Main'];
-    if(CONFIG.EMAILJS_PUBLIC_KEY){ try{ emailjs.init(CONFIG.EMAILJS_PUBLIC_KEY); }catch(e){} }
-    onDataChange();
-  });
   State.ready = true;
 }
 
@@ -414,48 +280,17 @@ function onDataChange(){
 }
 
 /* =========================================================================
-   Oak Core cutover 2026-09-24: users sync/save + hashPin via https://seanoakjoinery.github.io/oak-core/oak-core.js?v=2 — rollback branch backup-before-oak-core-2026-09-24
-   SHARED AUTH — same users[]/permissions system as the Dispatch, Stock
-   List, and Board Stock apps. Login/user-management via OakCore; this app's
-   OWN data (screws, consumables, people, transactions, suppliers) stays
-   at CONFIG.DB_PATH, untouched by any of this.
+   AUTH
    ========================================================================= */
-const APP_ID = "consumables";
-const APP_LABELS = { dispatch: "Dispatch app", stock: "Stock List app", boardStock: "Board Stock app", consumables: "Consumables app" };
-function defaultApps(){ return { dispatch: true, stock: true, boardStock: true, consumables: true }; }
-function getMainRoot(){ return State.sharedUsers.find(u => u.isMainRoot) || State.sharedUsers.find(u => u.isRoot) || null; }
-function isMainRoot(u){ const mr = getMainRoot(); return !!(u && mr && u.id === mr.id); }
-function currentUserIsMainRoot(){ return isMainRoot(State.currentUser); }
-function userHasApp(u, appId){
-  appId = appId || APP_ID;
-  if(!u) return false;
-  if(isMainRoot(u)) return true;
-  if(!u.apps) return true; // legacy account — not yet scoped
-  return !!u.apps[appId];
-}
-async function hashPin(pin){ return OakCore.hashPin(pin); }
-// Writes State.sharedUsers via OakCore (shared dispatchBoard/users path).
-async function saveSharedUsers(){
-  if(!oak) return;
-  try{ await oak.saveUsers(State.sharedUsers); }catch(e){ toast('Could not save users: ' + e.message, 'err'); }
-}
-function startSharedUsersSync(){
-  if(!oak) return;
-  oak.startUsersSync((list) => {
-    State.sharedUsers = Array.isArray(list) ? list : [];
-    onDataChange();
-  });
-}
+const SESSION_KEY = 'fixingsStockSession';
 
-const SESSION_KEY = 'consumablesStockSession';
-
-async function attemptLogin(username, pin){
-  const u = State.sharedUsers.find(x => x.username.toLowerCase() === username.trim().toLowerCase() && userHasApp(x));
-  if(!u) return 'No user with that username has access to this app.';
-  const enteredHash = await hashPin(pin.trim());
-  if(enteredHash !== u.pin) return 'Incorrect PIN.';
-  State.currentUser = u;
-  sessionStorage.setItem(SESSION_KEY, JSON.stringify({id: u.id}));
+function attemptLogin(username, pin){
+  const entry = Object.entries(State.users).find(([id,u]) => u.username.toLowerCase() === username.trim().toLowerCase());
+  if(!entry) return 'No user with that username.';
+  const [id, u] = entry;
+  if(String(u.pin) !== String(pin).trim()) return 'Incorrect PIN.';
+  State.currentUser = { id, username: u.username, isRoot: !!u.isRoot, perms: u.perms || DEFAULT_PERMS, signature: u.signature || '' };
+  sessionStorage.setItem(SESSION_KEY, JSON.stringify({id}));
   render();
   return null;
 }
@@ -465,8 +300,8 @@ function tryRestoreSession(){
     const raw = sessionStorage.getItem(SESSION_KEY);
     if(!raw) return;
     const {id} = JSON.parse(raw);
-    const u = State.sharedUsers.find(x => x.id === id);
-    if(u && userHasApp(u)) State.currentUser = u;
+    const u = State.users[id];
+    if(u) State.currentUser = { id, username: u.username, isRoot: !!u.isRoot, perms: u.perms || DEFAULT_PERMS, signature: u.signature || '' };
   }catch(e){}
 }
 
@@ -479,9 +314,8 @@ function logout(){
 function can(perm){
   if(!State.currentUser) return false;
   if(State.currentUser.isRoot) return true;
-  return !!(State.currentUser.permissions && State.currentUser.permissions[perm]);
+  return !!State.currentUser.perms[perm];
 }
-function currentUserIsRoot(){ return !!(State.currentUser && State.currentUser.isRoot); }
 
 /* =========================================================================
    REORDER EMAIL — bundled per supplier
@@ -489,24 +323,21 @@ function currentUserIsRoot(){ return !!(State.currentUser && State.currentUser.i
 let reorderQueue = {}; // supplierId (or '__none') -> [{itemLabel, currentQty, reorderQty}]
 let reorderFlushTimer = null;
 
-// Email sending moved server-side (weekly digest via GitHub Actions,
-// see dev notes) — this app no longer sends reorder emails itself the
-// instant something crosses its threshold. reorderSent is kept only as
-// harmless historical bookkeeping; nothing reads it anymore.
-function checkReorder(kind, id, label, currentQty, reorderQty, currentlySent, supplierId, isVolume){
+function checkReorder(kind, id, label, currentQty, reorderQty, currentlySent, supplierId){
   const belowThreshold = currentQty <= reorderQty;
   const path = kind === 'screw' ? 'screwItems' : 'consumableTypes';
   if(belowThreshold && !currentlySent){
+    enqueueReorder(supplierId, label, currentQty, reorderQty);
     dbRef(path + '/' + id + '/reorderSent').set(true);
   } else if(!belowThreshold && currentlySent){
     dbRef(path + '/' + id + '/reorderSent').set(false);
   }
 }
 
-function enqueueReorder(supplierId, itemLabel, currentQty, reorderQty, isVolume){
+function enqueueReorder(supplierId, itemLabel, currentQty, reorderQty){
   const key = supplierId || '__none';
   reorderQueue[key] = reorderQueue[key] || [];
-  reorderQueue[key].push({ itemLabel, currentQty, reorderQty, isVolume });
+  reorderQueue[key].push({ itemLabel, currentQty, reorderQty });
   if(reorderFlushTimer) clearTimeout(reorderFlushTimer);
   // short delay so several items dropping below threshold around the same time
   // (e.g. a batch of fill-level updates) land in one email per supplier
@@ -531,20 +362,15 @@ function sendSupplierReorderEmail(supplierId, items){
     toast('Reorder needed (' + supplierName + ') — email not sent, check EmailJS/supplier email setup', 'err');
     return;
   }
-  const lines = items.map((i,idx)=> i.isVolume
-    ? `${idx+1}. ${i.itemLabel}: ${mlToLabel(i.currentQty)} on hand (reorder at ${mlToLabel(i.reorderQty)})`
-    : `${idx+1}. ${i.itemLabel}: ${i.currentQty} on hand (reorder at ${i.reorderQty})`
-  ).join('\n');
+  const lines = items.map(i=> `${i.itemLabel}: ${i.currentQty} on hand (reorder at ${i.reorderQty})`).join('\n');
   const greeting = 'Good day' + (contactName ? ' ' + contactName : '') + ',';
-  // Numbered list + ending at "Kind regards," (no name) to match the
-  // signature card the user pasted directly into the EmailJS template
-  // itself — that's fixed HTML in the template now, not text this app
-  // builds, so it shows up the same regardless of who triggered the send.
-  const message = `${greeting}\n\nI hope this email finds you well.\n\nPlease quote me on the following:\n\n${lines}\n\nKind regards,`;
+  const signature = (State.currentUser && (State.currentUser.signature || State.currentUser.username)) || '';
+  const signOff = signature ? `\n\nKind regards,\n${signature}` : '';
+  const message = `${greeting}\n\nI hope this email finds you well.\n\nPlease quote me on the following:\n\n${lines}${signOff}`;
   emailjs.send(CONFIG.EMAILJS_SERVICE_ID, CONFIG.EMAILJS_TEMPLATE_ID, {
     to_email: toEmail,
     cc_email: ccEmail,
-    from_name: (State.currentUser && State.currentUser.username) || 'Oak Joinery',
+    from_name: signature,
     item_name: supplierName + ' — ' + items.length + ' item(s)',
     current_qty: '',
     reorder_qty: '',
@@ -555,11 +381,15 @@ function sendSupplierReorderEmail(supplierId, items){
 
 // Manual "send now" for a supplier, from the Suppliers tab — bypasses the queue/debounce.
 function sendReorderEmailNowForSupplier(supplierId){
-  const lowScrews = Object.values(State.screwItems||{}).filter(i=> stockAmount(i) <= i.reorderQty && (i.supplierId||'__none') === supplierId)
-    .map(i=>({ itemLabel: itemName(i) + ' (' + unitWord(i) + ')', currentQty: stockTotalLabel(i), reorderQty: i.reorderQty }));
-  const lowCons = Object.entries(State.consumableTypes||{}).filter(([tid,t])=>
-    isConsumableTypeLow(tid, t) && (t.supplierId||'__none') === supplierId
-  ).map(([tid,t])=> ({ itemLabel: t.name, currentQty: consumableTypeQty(tid,t), reorderQty: consumableTypeReorderLevel(t), isVolume: t.category==='liquid' }));
+  const lowScrews = Object.values(State.screwItems||{}).filter(i=> i.qtyBundles <= i.reorderQty && (i.supplierId||'__none') === supplierId)
+    .map(i=>({ itemLabel: i.size, currentQty: i.qtyBundles, reorderQty: i.reorderQty }));
+  const lowCons = Object.entries(State.consumableTypes||{}).filter(([tid,t])=>{
+    const active = Object.values(State.consumableUnits||{}).filter(u=>u.typeId===tid && u.fillLevel!=='Finished').length;
+    return active <= t.reorderQty && (t.supplierId||'__none') === supplierId;
+  }).map(([tid,t])=>{
+    const active = Object.values(State.consumableUnits||{}).filter(u=>u.typeId===tid && u.fillLevel!=='Finished').length;
+    return { itemLabel: t.name, currentQty: active, reorderQty: t.reorderQty };
+  });
   const items = [...lowScrews, ...lowCons];
   if(items.length === 0){ toast('Nothing from this supplier currently needs reordering', 'err'); return; }
   sendSupplierReorderEmail(supplierId, items);
@@ -570,11 +400,7 @@ function sendReorderEmailNowForSupplier(supplierId){
    ========================================================================= */
 function render(){
   const app = document.getElementById('app');
-  if(!State.db){ return; } // still connecting
-  // Root/login comes from the SHARED roster (dispatchBoard/users), not
-  // this app's own data — an empty roster means nobody has set up ANY
-  // of the four apps yet, not just this one.
-  if(State.sharedUsers.length === 0){ app.innerHTML=''; app.appendChild(renderCreateRootAccount()); return; }
+  if(!State.db){ return; } // setup screen already showing
   if(!State.currentUser){ tryRestoreSession(); }
   if(!State.currentUser){ app.innerHTML = ''; app.appendChild(renderLogin()); return; }
 
@@ -588,63 +414,17 @@ function render(){
   else if(State.activeTab === 'people') main.appendChild(renderPeopleTab());
   else if(State.activeTab === 'reports') main.appendChild(renderReportsTab());
   else if(State.activeTab === 'suppliers') main.appendChild(renderSuppliersTab());
-  else if(State.activeTab === 'dispatch') main.appendChild(renderSendToDispatchTab());
-  else if(State.activeTab === 'count') main.appendChild(renderCountTab());
   else if(State.activeTab === 'admin') main.appendChild(renderAdminTab());
   app.appendChild(main);
 }
 
-/* ---------- Root account creation (shared roster, first run only) ---------- */
-// Runs when dispatchBoard/users is completely empty — i.e. nobody has
-// set up ANY of the four apps yet. Same shape/behaviour as the other
-// three apps' root-creation screen, so whichever app someone opens
-// first, the result is the same one shared main root.
-function renderCreateRootAccount(){
-  const wrap = el('div','login-wrap');
-  const box = el('div','login-box');
-  box.innerHTML = `
-    <h1>Set up root account</h1>
-    <div class="sub">First time opening any of the Oak Joinery apps. Create the main account — it has full access to everything and can add other users afterwards.</div>
-    <label>Username</label>
-    <input type="text" id="su-user" autocomplete="username">
-    <label>PIN (at least 4 characters)</label>
-    <input type="password" id="su-pin" autocomplete="new-password">
-    <div class="btn-row"><button class="btn btn-amber" id="su-btn" style="width:100%">Create root account</button></div>
-    <div class="err" id="su-err"></div>
-  `;
-  wrap.appendChild(box);
-  setTimeout(()=>{
-    const doCreate = async ()=>{
-      const username = document.getElementById('su-user').value.trim();
-      const pin = document.getElementById('su-pin').value;
-      const err = document.getElementById('su-err');
-      if(!username || !pin){ err.textContent = 'Username and PIN are required.'; return; }
-      if(pin.length < 4){ err.textContent = 'PIN must be at least 4 characters.'; return; }
-      err.textContent = '';
-      const rootUser = { id: uid(), username, pin: await hashPin(pin), isRoot: true, isMainRoot: true, permissions: {...DEFAULT_PERMS, manageUsers:true}, apps: defaultApps() };
-      State.sharedUsers = [rootUser];
-      await saveSharedUsers();
-      render();
-    };
-    document.getElementById('su-btn').onclick = doCreate;
-    document.getElementById('su-pin').addEventListener('keydown', e=>{ if(e.key==='Enter') doCreate(); });
-  });
-  return wrap;
-}
-
-/* ---------- Login (shared roster, filtered to this app) ---------- */
+/* ---------- Login ---------- */
 function renderLogin(){
   const wrap = el('div','login-wrap');
   const box = el('div','login-box');
-  const availableUsers = State.sharedUsers.filter(u => userHasApp(u));
-  if(availableUsers.length === 0){
-    box.innerHTML = `<h1>No access</h1><div class="sub">No account on this board has been given access to the Consumables app. Ask the main root account to grant access under Manage Users.</div>`;
-    wrap.appendChild(box);
-    return wrap;
-  }
   box.innerHTML = `
     <h1>Fixings &amp; Finishing Stock</h1>
-    <div class="sub">Oak Joinery — sign in${window.OakCore && OakCore.VERSION ? (" · oak-core " + OakCore.VERSION) : ""}</div>
+    <div class="sub">Oak Joinery — sign in</div>
     <label>Username</label>
     <input type="text" id="li-user" autocomplete="username">
     <label>PIN</label>
@@ -654,10 +434,10 @@ function renderLogin(){
   `;
   wrap.appendChild(box);
   setTimeout(()=>{
-    const doLogin = async ()=>{
+    const doLogin = ()=>{
       const u = document.getElementById('li-user').value;
       const p = document.getElementById('li-pin').value;
-      const err = await attemptLogin(u,p);
+      const err = attemptLogin(u,p);
       document.getElementById('li-err').textContent = err || '';
     };
     document.getElementById('li-btn').onclick = doLogin;
@@ -672,8 +452,7 @@ function renderTopbar(){
   bar.innerHTML = `
     <div class="brand"><span class="mark">OJ//STOCK</span><h1>Fixings &amp; Finishing</h1></div>
     <div class="who">
-      <div class="brand-wordmark">OAK<span>JOINERY</span></div>
-      <span>${State.currentUser.username}${isMainRoot(State.currentUser) ? ' · main root' : (State.currentUser.isRoot ? ' · root' : '')}</span>
+      <span>${State.currentUser.username}${State.currentUser.isRoot ? ' · root' : ''}</span>
       <button id="logout-btn">Sign out</button>
     </div>
   `;
@@ -684,15 +463,12 @@ function renderTopbar(){
 function renderTabs(){
   const tabs = el('div','tabs');
   const items = [
-    ['screws','Consumables'],
-    ['consumables','Liquid'],
-    ['people','Allocations'],
+    ['screws','Screws'],
+    ['consumables','Thinners & Stopping'],
+    ['people','People'],
+    ['reports','Reports & Export'],
     ['suppliers','Suppliers'],
   ];
-  // "View reports" permission was being ignored — the tab showed for everyone.
-  if(can('consViewReports') || can('consExportExcel')) items.splice(3, 0, ['reports','Reports & Export']);
-  if(can('consManageItems')) items.push(['count','Stock Count']);
-  if(can('consSendToDispatch')) items.push(['dispatch','Send to Dispatch']);
   if(State.currentUser.isRoot || can('manageUsers')) items.push(['admin','Admin']);
   items.forEach(([key,label])=>{
     const b = document.createElement('button');
@@ -707,157 +483,45 @@ function renderTabs(){
 function el(tag, cls){ const e = document.createElement(tag); if(cls) e.className = cls; return e; }
 
 /* ---------- Screws Tab ---------- */
-/* ---------- Counted items: Consumables tab + stain tins on the Liquid tab ----------
-   Changed 2026-09-24 per user request: the old "Screws" tab is now
-   "Consumables", and every item picks a unit —
-     per500 : screws, counted in bundles (of 500 by default)
-     each   : hinges, sanding pads, wood stopping tubs (optional 250 g /
-              500 g / 1 kg size — each tub counted individually)
-     roll   : production rolls — whole rolls counted, plus ONE open roll
-              per location marked Full / 3/4 / 1/2 / 1/4
-     tin    : stains etc. bought in 500 ml or 1 L tins — shown on the
-              Liquid tab, counted per tin
-   They all live in the same screwItems list, so hand-out, restock, Send
-   to Dispatch, reports, Excel and the weekly reorder email keep working
-   for every kind. Items saved before this change have no unit and are
-   treated as per500 screws, exactly as before. */
-// Extended 2026-09-24 after researching what joinery workshops actually
-// stock (Blum/Hettich hardware, Klingspor abrasives, PVC edging, SA
-// cabinet-fitting wholesalers): packs of N (screws, confirmats, cam
-// locks, shelf pins, sanding discs), each (hinges, plates, handles,
-// legs, cartridges, stopping tubs), PAIRS (drawer runners are always
-// sold left+right, by length), rolls (edging, production paper, tape,
-// stretch wrap) and tins (stains/lacquers).
-const ITEM_UNITS = {
-  per500: { label: 'per 500', word: 'pack(s)',  tab: 'screws' },
-  each:   { label: 'each',    word: 'each',     tab: 'screws' },
-  pair:   { label: 'pairs',   word: 'pair(s)',  tab: 'screws' },
-  roll:   { label: 'rolls',   word: 'roll(s)',  tab: 'screws' },
-  tin:    { label: 'tins',    word: 'tin(s)',   tab: 'consumables' }
-};
-const ITEM_CATEGORIES = [
-  'Screws & fasteners', 'Knock-down fittings', 'Hinges & hinge plates', 'Drawer runners',
-  'Handles, knobs & legs', 'Brackets, stays & supports', 'Locks & catches', 'Edging',
-  'Adhesives & sealants', 'Fillers & stopping', 'Abrasives', 'Packaging & protection',
-  'Workshop & PPE', 'Stains & finishes', 'Other'
-];
-const DEFAULT_CATEGORY = { per500: 'Screws & fasteners', each: 'Other', pair: 'Drawer runners', roll: 'Packaging & protection', tin: 'Stains & finishes' };
-// Size suggestions (free text is allowed too) — the common ones for each unit.
-const SIZE_SUGGESTIONS = {
-  each: ['250 g', '500 g', '1 kg', '5 kg', '25 kg', '290 ml cartridge', '110°', '155°', '170°', '0 mm plate', '3 mm plate', '125 mm', '150 mm', 'P80', 'P120', 'P180', 'P240', 'P320'],
-  roll: ['22 mm x 0.45 mm', '22 mm x 1 mm', '22 mm x 2 mm', '100 m', '200 m', '24 mm tape', '48 mm tape', '500 mm stretch wrap'],
-  per500: ['4 x 16', '4 x 30', '4 x 40', '6 x 16', '7 x 50 confirmat', '15 mm cam', '5 mm shelf pin', '8 x 30 dowel', 'P120', '125 mm']
-};
-const EACH_SIZES = SIZE_SUGGESTIONS.each; // kept for older code paths
-const RUNNER_LENGTHS = ['250 mm', '270 mm', '300 mm', '350 mm', '400 mm', '450 mm', '500 mm', '550 mm', '600 mm'];
-const TIN_SIZES = ['250 ml', '500 ml', '1 L', '5 L', '20 L'];
-const ROLL_LEVELS = ['Full', '3/4', '1/2', '1/4'];
-const ROLL_FRACTION = { 'Full': 1, '3/4': 0.75, '1/2': 0.5, '1/4': 0.25 };
-const ROLL_SYMBOL = { 'Full': 'full', '3/4': '¾', '1/2': '½', '1/4': '¼' };
-
-function itemUnit(item){ return (item && ITEM_UNITS[item.unit]) ? item.unit : 'per500'; }
-function unitWord(item){ return ITEM_UNITS[itemUnit(item)].word; }
-function itemName(item){ return (item.size || '') + (item.packSize ? ' (' + item.packSize + ')' : ''); }
-function itemCategory(item){
-  return (item && item.category) || DEFAULT_CATEGORY[itemUnit(item)] || 'Other';
-}
-function unitLabel(item){
-  const u = itemUnit(item);
-  if(u === 'per500') return 'pack of ' + (item.bundleSize || 500);
-  if(u === 'tin') return (item.packSize || '') + ' tins';
-  return ITEM_UNITS[u].label;
-}
-function openRollAt(item, location){ return (item.openRollByLocation && item.openRollByLocation[location]) || null; }
-function openRollTotal(item){
-  return Object.values(item.openRollByLocation || {}).reduce((a, l) => a + (ROLL_FRACTION[l] || 0), 0);
-}
-// What counts toward "low stock": whole units, plus open-roll fractions for rolls.
-function stockAmount(item){
-  return totalScrewQty(item) + (itemUnit(item) === 'roll' ? openRollTotal(item) : 0);
-}
-function stockAtLabel(item, location){
-  const n = screwQtyAt(item, location);
-  if(itemUnit(item) !== 'roll') return String(n);
-  const open = openRollAt(item, location);
-  return open ? `${n} + ${ROLL_SYMBOL[open]} open` : String(n);
-}
-function stockTotalLabel(item){
-  const n = totalScrewQty(item);
-  if(itemUnit(item) !== 'roll') return `${n}`;
-  const opens = Object.values(item.openRollByLocation || {}).filter(Boolean);
-  return opens.length ? `${n} + ${opens.map(l => ROLL_SYMBOL[l]).join(' + ')} open` : `${n}`;
-}
-function itemsForTab(tabKey){
-  return Object.entries(State.screwItems || {})
-    .filter(([id, item]) => ITEM_UNITS[itemUnit(item)].tab === tabKey)
-    .sort((a, b) => itemName(a[1]).localeCompare(itemName(b[1]), undefined, { numeric: true }));
-}
-
 function renderScrewsTab(){
-  const container = el('div', '');
-  container.appendChild(renderCountedCard('screws'));
-  return container;
-}
+  const wrap = document.createDocumentFragment ? el('div','') : el('div','');
+  const items = Object.entries(State.screwItems || {}).sort((a,b)=> a[1].size.localeCompare(b[1].size, undefined, {numeric:true}));
 
-function renderCountedCard(tabKey){
-  const onLiquidTab = tabKey === 'consumables';
-  const items = itemsForTab(tabKey);
-  const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
-
-  const card = el('div', 'card');
-  const header = el('div', '');
-  header.innerHTML = onLiquidTab
-    ? `<h2>Tins (stains, lacquers etc.)</h2><div class="sub">Counted per tin — pick the tin size (250 ml, 500 ml, 1 L, 5 L or 20 L) for each item.</div>`
-    : `<h2>Consumables</h2><div class="sub">Grouped by category. Screws and fittings in packs (per 500 etc.), hinges, plates and stopping tubs each, drawer runners in pairs, and rolls (edging, production rolls) as whole rolls plus the open roll (Full / ¾ / ½ / ¼).</div>`;
+  const card = el('div','card');
+  const header = el('div','');
+  header.innerHTML = `<h2>Screw stock</h2><div class="sub">Quantities are in bundles of 500 unless the item says otherwise.</div>`;
   card.appendChild(header);
 
   if(items.length === 0){
-    card.appendChild(elHtml('div', 'empty', onLiquidTab ? 'No tins added yet.' : 'No consumables added yet.'));
+    card.appendChild(elHtml('div','empty','No screw sizes added yet.'));
   } else {
     const table = document.createElement('table');
-    table.innerHTML = `<thead><tr><th>Item</th><th>Unit</th><th>On hand</th><th>By location</th><th>Reorder at</th><th>Supplier</th><th>Status</th><th></th></tr></thead>`;
+    table.innerHTML = `<thead><tr><th>Size</th><th>Bundle size</th><th>On hand (bundles)</th><th>Reorder at</th><th>Supplier</th><th>Status</th><th></th></tr></thead>`;
     const tbody = document.createElement('tbody');
-    // Grouped by category, in the order of ITEM_CATEGORIES.
-    const catOrder = c => { const i = ITEM_CATEGORIES.indexOf(c); return i < 0 ? 999 : i; };
-    items.sort((a, b) => (catOrder(itemCategory(a[1])) - catOrder(itemCategory(b[1]))) || itemName(a[1]).localeCompare(itemName(b[1]), undefined, { numeric: true }));
-    let lastCat = null;
-    items.forEach(([id, item]) => {
-      const cat = itemCategory(item);
-      if(!onLiquidTab && cat !== lastCat){
-        const hr = document.createElement('tr');
-        hr.innerHTML = `<td colspan="8" style="font-weight:700;padding-top:14px;color:var(--amber, #d59a3a);">${escapeHtml(cat)}</td>`;
-        tbody.appendChild(hr);
-        lastCat = cat;
-      }
-      const low = stockAmount(item) <= item.reorderQty;
+    items.forEach(([id,item])=>{
+      const low = item.qtyBundles <= item.reorderQty;
       const supplierName = item.supplierId && State.suppliers[item.supplierId] ? State.suppliers[item.supplierId].name : '—';
-      const breakdown = locations.map(l => `${escapeHtml(l)}: ${stockAtLabel(item, l)}`).join(', ');
       const tr = document.createElement('tr');
       if(low) tr.className = 'low-stock';
       tr.innerHTML = `
-        <td>${thumbHtml(item.photoUrl)}${escapeHtml(itemName(item))}</td>
-        <td>${escapeHtml(unitLabel(item))}</td>
-        <td class="num">${escapeHtml(stockTotalLabel(item))}</td>
-        <td class="sub" style="font-size:12px;">${breakdown}</td>
+        <td>${escapeHtml(item.size)}</td>
+        <td class="num">${item.bundleSize}</td>
+        <td class="num">${item.qtyBundles}</td>
         <td class="num">${item.reorderQty}</td>
         <td>${escapeHtml(supplierName)}</td>
         <td>${low ? '<span class="pill low">Reorder</span>' : '<span class="pill ok">OK</span>'}</td>
         <td></td>
       `;
       const actionsTd = tr.lastElementChild;
-      if(can('consHandOut')){
-        actionsTd.appendChild(smallBtn('Hand out', () => openHandOutModal('screw', id)));
+      if(can('handOut')){
+        const outBtn = smallBtn('Hand out', ()=> openHandOutModal('screw', id));
+        actionsTd.appendChild(outBtn);
       }
-      if(itemUnit(item) === 'roll' && can('consManageConsumables')){
-        const rollBtn = smallBtn('Open roll', () => openRollModal(id));
-        rollBtn.style.marginLeft = '6px';
-        actionsTd.appendChild(rollBtn);
-      }
-      if(can('consManageItems')){
-        const restockBtn = smallBtn('Restock', () => openRestockModal('screw', id));
+      if(can('manageItems')){
+        const restockBtn = smallBtn('Restock', ()=> openRestockModal('screw', id));
         restockBtn.style.marginLeft = '6px';
         actionsTd.appendChild(restockBtn);
-        const editBtn = smallBtn('Edit', () => openEditScrewModal(id));
+        const editBtn = smallBtn('Edit', ()=> openEditScrewModal(id));
         editBtn.style.marginLeft = '6px';
         actionsTd.appendChild(editBtn);
       }
@@ -867,16 +531,19 @@ function renderCountedCard(tabKey){
     card.appendChild(table);
   }
 
-  if(can('consManageItems')){
-    const row = el('div', 'btn-row');
+  if(can('manageItems')){
+    const row = el('div','btn-row');
     const addBtn = document.createElement('button');
     addBtn.className = 'btn btn-amber';
-    addBtn.textContent = onLiquidTab ? '+ Add tin item (stain etc.)' : '+ Add consumable';
-    addBtn.onclick = () => openAddScrewModal(onLiquidTab ? 'tin' : 'per500');
+    addBtn.textContent = '+ Add screw size';
+    addBtn.onclick = openAddScrewModal;
     row.appendChild(addBtn);
     card.appendChild(row);
   }
-  return card;
+
+  const container = el('div','');
+  container.appendChild(card);
+  return container;
 }
 
 function smallBtn(label, onClick){
@@ -895,179 +562,54 @@ function supplierSelectHtml(id, selectedId){
   return `<label>Supplier</label><select id="${id}"><option value="">No supplier set</option>${opts}</select>`;
 }
 
-function locationSelectHtml(id, selected){
-  const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
-  return `<label>Location</label><select id="${id}">${locations.map(l=>`<option value="${escapeHtml(l)}" ${l===selected?'selected':''}>${escapeHtml(l)}</option>`).join('')}</select>`;
-}
-
-
-// ---------- Item photos (2026-09-24) ----------
-// A photo per item so staff pick the right hinge / runner / edging. Photos
-// are shrunk on the phone (max 800 px) and stored in Firebase Storage
-// (consumablePhotos/); only the link is saved on the item.
-function shrinkPhoto(file, maxSide){
-  return new Promise(resolve => {
-    const img = new Image();
-    img.onload = () => {
-      const scale = Math.min(1, (maxSide || 800) / Math.max(img.width, img.height));
-      const c = document.createElement('canvas');
-      c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
-      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-      c.toBlob(b => resolve(b), 'image/jpeg', 0.8);
-    };
-    img.onerror = () => resolve(null);
-    img.src = URL.createObjectURL(file);
-  });
-}
-async function uploadItemPhoto(collection, id, file){
-  try{
-    const blob = await shrinkPhoto(file, 800);
-    if(!blob) throw new Error('Could not read that photo');
-    const ref = firebase.storage().ref(`consumablePhotos/${collection}-${id}.jpg`);
-    await ref.put(blob, { contentType: 'image/jpeg' });
-    const url = await ref.getDownloadURL();
-    await dbRef(collection + '/' + id + '/photoUrl').set(url);
-    toast('Photo saved', 'ok');
-  }catch(e){
-    toast('Photo could not be saved: ' + (e.message || e), 'err');
-  }
-}
-function photoFieldHtml(currentUrl){
-  return `<label>Photo (optional)</label>
-    ${currentUrl ? `<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;"><img src="${currentUrl}" style="width:64px;height:64px;object-fit:cover;border-radius:6px;"><label style="font-weight:400;display:flex;align-items:center;gap:6px;"><input type="checkbox" id="m-photo-remove" style="width:auto;"> Remove photo</label></div>` : ''}
-    <input type="file" id="m-photo" accept="image/*" capture="environment">`;
-}
-function readPhotoField(){
-  const f = document.getElementById('m-photo');
-  const rm = document.getElementById('m-photo-remove');
-  return { file: f && f.files && f.files[0] ? f.files[0] : null, remove: !!(rm && rm.checked) };
-}
-function thumbHtml(url){
-  return url ? `<img src="${url}" alt="" onclick="window.open('${url}','_blank')" style="width:36px;height:36px;object-fit:cover;border-radius:5px;vertical-align:middle;margin-right:8px;cursor:zoom-in;">` : '';
-}
-
-// Unit + size + category fields shared by the Add and Edit forms.
-function unitFieldsHtml(item, lockedToTin){
-  const unit = itemUnit(item);
-  const cat = (item && item.category) || DEFAULT_CATEGORY[unit];
-  const unitSelect = lockedToTin
-    ? `<input type="hidden" id="m-unit" value="tin">`
-    : `<label>Unit</label><select id="m-unit">
-         <option value="per500" ${unit==='per500'?'selected':''}>Pack / box of N (screws per 500, confirmats, cam locks, sanding discs…)</option>
-         <option value="each" ${unit==='each'?'selected':''}>Each (hinges, plates, handles, stopping tubs, cartridges…)</option>
-         <option value="pair" ${unit==='pair'?'selected':''}>Pairs (drawer runners — left + right)</option>
-         <option value="roll" ${unit==='roll'?'selected':''}>Rolls (edging, production rolls, tape — open roll in ¼ steps)</option>
-       </select>`;
-  const catSelect = lockedToTin
-    ? `<input type="hidden" id="m-category" value="${escapeHtml(cat || 'Stains & finishes')}">`
-    : `<label>Category</label><select id="m-category">${ITEM_CATEGORIES.map(c => `<option value="${escapeHtml(c)}" ${c===cat?'selected':''}>${escapeHtml(c)}</option>`).join('')}</select>`;
-  const curSize = (item && item.packSize) || '';
-  const lenVal = (item && item.unit === 'pair') ? curSize : '450 mm';
-  const tinVal = (item && item.unit === 'tin') ? (curSize || '1 L') : '1 L';
-  return `${unitSelect}
-    <div id="m-bundle-wrap"><label>How many in a pack / box</label><input type="number" id="m-bundle" value="${(item && item.bundleSize) || 500}"></div>
-    <div id="m-size-wrap"><label>Size / spec (optional — pick or type)</label>
-      <input type="text" id="m-sizespec" list="m-size-list" value="${escapeHtml((item && item.unit !== 'pair' && item.unit !== 'tin') ? curSize : '')}" placeholder="e.g. 500 g, 110°, 22 mm x 1 mm">
-      <datalist id="m-size-list"></datalist></div>
-    <div id="m-length-wrap"><label>Runner length</label>
-      <select id="m-length">${RUNNER_LENGTHS.map(s => `<option value="${s}" ${s===lenVal?'selected':''}>${s}</option>`).join('')}${lenVal && !RUNNER_LENGTHS.includes(lenVal) ? `<option value="${escapeHtml(lenVal)}" selected>${escapeHtml(lenVal)}</option>` : ''}</select></div>
-    <div id="m-tinsize-wrap"><label>Tin size</label>
-      <select id="m-tinsize">${TIN_SIZES.map(s => `<option value="${s}" ${s===tinVal?'selected':''}>${s}</option>`).join('')}</select></div>
-    ${catSelect}`;
-}
-function wireUnitFields(){
-  const sel = document.getElementById('m-unit');
-  const catSel = document.getElementById('m-category');
-  let lastUnit = sel.value;
-  const show = () => {
-    const u = sel.value;
-    document.getElementById('m-bundle-wrap').style.display = u === 'per500' ? 'block' : 'none';
-    document.getElementById('m-size-wrap').style.display = (u === 'each' || u === 'roll' || u === 'per500') ? 'block' : 'none';
-    document.getElementById('m-length-wrap').style.display = u === 'pair' ? 'block' : 'none';
-    document.getElementById('m-tinsize-wrap').style.display = u === 'tin' ? 'block' : 'none';
-    document.getElementById('m-size-list').innerHTML = (SIZE_SUGGESTIONS[u] || []).map(v => `<option value="${escapeHtml(v)}">`).join('');
-    document.querySelectorAll('.m-unitword').forEach(e => e.textContent = ITEM_UNITS[u].word);
-    // Follow the unit's usual category unless someone already picked a different one.
-    if(catSel && catSel.tagName === 'SELECT' && catSel.value === DEFAULT_CATEGORY[lastUnit]) catSel.value = DEFAULT_CATEGORY[u];
-    lastUnit = u;
-  };
-  if(sel.tagName === 'SELECT') sel.onchange = show;
-  show();
-}
-function readUnitFields(){
-  const unit = document.getElementById('m-unit').value;
-  const out = { unit, packSize: '', bundleSize: null, category: document.getElementById('m-category').value || DEFAULT_CATEGORY[unit] };
-  if(unit === 'per500') out.bundleSize = parseInt(document.getElementById('m-bundle').value) || 500;
-  if(unit === 'each' || unit === 'roll' || unit === 'per500') out.packSize = document.getElementById('m-sizespec').value.trim();
-  if(unit === 'pair') out.packSize = document.getElementById('m-length').value;
-  if(unit === 'tin') out.packSize = document.getElementById('m-tinsize').value;
-  return out;
-}
-
-function openAddScrewModal(defaultUnit){
-  defaultUnit = defaultUnit || 'per500';
-  const isTin = defaultUnit === 'tin';
-  openModal(isTin ? 'Add tin item' : 'Add consumable', `
-    <label>${isTin ? 'Name (e.g. Oak stain, Clear lacquer)' : 'Name (e.g. Chipboard screw, Blum soft-close hinge, Tandem runner, PVC edging white, Sanding disc)'}</label>
+function openAddScrewModal(){
+  openModal('Add screw size', `
+    <label>Size (e.g. 6 x 16)</label>
     <input type="text" id="m-size">
-    ${unitFieldsHtml({ unit: defaultUnit }, isTin)}
     <div class="row2">
-      <div><label>Reorder at (<span class="m-unitword"></span>)</label><input type="number" id="m-reorder" value="2"></div>
-      <div><label>Starting qty (<span class="m-unitword"></span>)</label><input type="number" id="m-qty" value="0"></div>
+      <div><label>Bundle size</label><input type="number" id="m-bundle" value="500"></div>
+      <div><label>Reorder at (bundles)</label><input type="number" id="m-reorder" value="2"></div>
     </div>
-    ${locationSelectHtml('m-loc', null)}
+    <label>Starting qty (bundles)</label>
+    <input type="number" id="m-qty" value="0">
     ${supplierSelectHtml('m-supplier', null)}
-    ${photoFieldHtml(null)}
   `, ()=>{
     const size = document.getElementById('m-size').value.trim();
-    const photo = readPhotoField();
-    const u = readUnitFields();
+    const bundleSize = parseInt(document.getElementById('m-bundle').value) || 500;
     const reorderQty = parseInt(document.getElementById('m-reorder').value) || 0;
-    const qty = parseInt(document.getElementById('m-qty').value) || 0;
-    const location = document.getElementById('m-loc').value;
+    const qtyBundles = parseInt(document.getElementById('m-qty').value) || 0;
     const supplierId = document.getElementById('m-supplier').value || null;
-    if(!size){ toast('Enter a name', 'err'); return false; }
-    const rec = { size, unit: u.unit, category: u.category, qtyByLocation: { [location]: qty }, reorderQty, reorderSent:false, supplierId };
-    if(u.bundleSize) rec.bundleSize = u.bundleSize;
-    if(u.packSize) rec.packSize = u.packSize;
-    const newId = uid();
-    dbRef('screwItems/' + newId).set(rec).then(() => { if(photo.file) uploadItemPhoto('screwItems', newId, photo.file); });
+    if(!size){ toast('Enter a size', 'err'); return false; }
+    dbRef('screwItems/' + uid()).set({ size, bundleSize, qtyBundles, reorderQty, reorderSent:false, supplierId });
     return true;
   });
-  setTimeout(wireUnitFields);
 }
 
 function openEditScrewModal(id){
   const item = State.screwItems[id];
-  const isTin = itemUnit(item) === 'tin';
-  openModal('Edit ' + itemName(item), `
-    <label>Name</label>
+  openModal('Edit ' + item.size, `
+    <label>Size</label>
     <input type="text" id="m-size" value="${escapeHtml(item.size)}">
-    ${unitFieldsHtml(item, isTin)}
-    <label>Reorder at (<span class="m-unitword"></span>)</label><input type="number" id="m-reorder" value="${item.reorderQty}">
+    <div class="row2">
+      <div><label>Bundle size</label><input type="number" id="m-bundle" value="${item.bundleSize}"></div>
+      <div><label>Reorder at (bundles)</label><input type="number" id="m-reorder" value="${item.reorderQty}"></div>
+    </div>
     ${supplierSelectHtml('m-supplier', item.supplierId)}
-    ${photoFieldHtml(item.photoUrl)}
     <div class="btn-row"><button class="btn btn-danger" id="m-delete" type="button">Delete this item</button></div>
   `, ()=>{
     const size = document.getElementById('m-size').value.trim();
-    const photo = readPhotoField();
-    const u = readUnitFields();
+    const bundleSize = parseInt(document.getElementById('m-bundle').value) || 500;
     const reorderQty = parseInt(document.getElementById('m-reorder').value) || 0;
     const supplierId = document.getElementById('m-supplier').value || null;
-    if(!size){ toast('Enter a name', 'err'); return false; }
-    const upd = { size, unit: u.unit, category: u.category, reorderQty, supplierId, bundleSize: u.bundleSize || null, packSize: u.packSize || null };
-    if(u.unit !== 'roll') upd.openRollByLocation = null;
-    if(photo.remove && !photo.file) upd.photoUrl = null;
-    dbRef('screwItems/' + id).update(upd);
-    if(photo.file) uploadItemPhoto('screwItems', id, photo.file);
-    checkReorder('screw', id, size, stockAmount({ ...item, ...upd }), reorderQty, item.reorderSent, supplierId);
+    if(!size){ toast('Enter a size', 'err'); return false; }
+    dbRef('screwItems/' + id).update({ size, bundleSize, reorderQty, supplierId });
+    checkReorder('screw', id, size, item.qtyBundles, reorderQty, item.reorderSent, supplierId);
     return true;
   });
   setTimeout(()=>{
-    wireUnitFields();
     const del = document.getElementById('m-delete');
     if(del) del.onclick = ()=>{
-      if(confirm('Delete ' + itemName(item) + '? This cannot be undone.')){
+      if(confirm('Delete ' + item.size + '? This cannot be undone.')){
         dbRef('screwItems/' + id).remove();
         closeModal();
       }
@@ -1075,502 +617,92 @@ function openEditScrewModal(id){
   });
 }
 
-// Production rolls: set how full the open roll is at a location, optionally
-// taking a fresh roll from the full-roll count to open it.
-function openRollModal(id){
-  const item = State.screwItems[id];
-  const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
-  openModal('Open roll — ' + itemName(item), `
-    ${locationSelectHtml('m-loc', null)}
-    <label>Open roll is now</label>
-    <select id="m-level">
-      ${ROLL_LEVELS.map(l => `<option value="${l}">${l === 'Full' ? 'Full' : l}</option>`).join('')}
-      <option value="">Finished / no open roll</option>
-    </select>
-    <label style="display:flex;align-items:center;gap:7px;font-weight:400;margin-top:10px;">
-      <input type="checkbox" id="m-newroll" style="width:auto;"> Take a new roll from stock to open (−1 full roll)
-    </label>
-    <div class="sub" id="m-rollnow" style="margin-top:8px"></div>
-  `, ()=>{
-    const location = document.getElementById('m-loc').value;
-    const level = document.getElementById('m-level').value;
-    const takeNew = document.getElementById('m-newroll').checked;
-    const open = { ...(item.openRollByLocation || {}) };
-    if(level) open[location] = level; else delete open[location];
-    if(takeNew){
-      const here = screwQtyAt(item, location);
-      if(here < 1 && !confirm(`There are no full rolls left at ${location}. Open one anyway? Stock will show as negative there.`)) return false;
-      const q = { ...(item.qtyByLocation || {}) };
-      q[location] = here - 1;
-      dbRef('screwItems/' + id + '/qtyByLocation').set(q);
-      item.qtyByLocation = q;
-    }
-    dbRef('screwItems/' + id + '/openRollByLocation').set(Object.keys(open).length ? open : null);
-    item.openRollByLocation = open;
-    checkReorder('screw', id, itemName(item), stockAmount(item), item.reorderQty, item.reorderSent, item.supplierId);
-    toast('Updated ' + itemName(item), 'ok');
-    return true;
-  });
-  setTimeout(()=>{
-    const locSel = document.getElementById('m-loc');
-    const lvl = document.getElementById('m-level');
-    const info = document.getElementById('m-rollnow');
-    const sync = () => {
-      const cur = openRollAt(item, locSel.value);
-      lvl.value = cur || 'Full';
-      info.textContent = `At ${locSel.value}: ${screwQtyAt(item, locSel.value)} full roll(s)` + (cur ? `, open roll ${ROLL_SYMBOL[cur]}` : ', no open roll');
-      document.getElementById('m-newroll').checked = !cur;
-    };
-    locSel.onchange = sync;
-    sync();
-  });
-}
-
 function openRestockModal(kind, id){
   const item = kind === 'screw' ? State.screwItems[id] : State.consumableTypes[id];
-  const label = kind === 'screw' ? itemName(item) : item.name;
-  const word = kind === 'screw' ? unitWord(item) : 'bundle(s)';
+  const label = kind === 'screw' ? item.size : item.name;
   openModal('Restock ' + label, `
-    <label>Amount to add (${word})</label>
+    <label>Bundles to add</label>
     <input type="number" id="m-add" value="1" min="1">
-    ${kind === 'screw' ? locationSelectHtml('m-loc', null) : ''}
   `, ()=>{
     const add = parseInt(document.getElementById('m-add').value) || 0;
     if(add <= 0){ toast('Enter a positive amount', 'err'); return false; }
-    if(kind === 'screw'){
-      const location = document.getElementById('m-loc').value;
-      if(!item.qtyByLocation) item.qtyByLocation = {};
-      item.qtyByLocation[location] = (item.qtyByLocation[location] || 0) + add;
-      dbRef('screwItems/' + id + '/qtyByLocation').set(item.qtyByLocation);
-      checkReorder('screw', id, label, stockAmount(item), item.reorderQty, item.reorderSent, item.supplierId);
-    }
+    const newQty = item.qtyBundles + add;
+    dbRef('screwItems/' + id + '/qtyBundles').set(newQty);
+    checkReorder('screw', id, label, newQty, item.reorderQty, item.reorderSent, item.supplierId);
     toast('Restocked ' + label, 'ok');
     return true;
   });
 }
 
-
-// ---------- Allocation (2026-09-24, per user request) ----------
-// "one user hands out the stock so he can allocate to which user it's
-// allocated, or when it's sent out to site or head office straight".
-// The logged-in user is saved as handedOutBy; the dropdown picks where
-// it went: a team member (the shared login list), another named person,
-// a site/job, or Head office. Each destination is also a People entry
-// so the People tab and Excel export keep grouping by recipient.
-function allocationSelectHtml(){
-  const users = (State.sharedUsers || []).filter(u => u && u.username).map(u => u.username)
-    .sort((a, b) => a.localeCompare(b));
-  const userSet = new Set(users.map(n => n.toLowerCase()));
-  const others = Object.entries(State.people || {})
-    .filter(([pid, p]) => p && p.name && !p.kind && !userSet.has(p.name.toLowerCase()))
-    .sort((a, b) => a[1].name.localeCompare(b[1].name));
-  const sites = [...new Set(Object.values(State.people || {}).filter(p => p && p.kind === 'site').map(p => p.name.replace(/^Site — /, '')))].sort();
-  return `
-    <label>Allocate to</label>
-    <select id="m-alloc">
-      <optgroup label="Team members">${users.map(n => `<option value="user:${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('')}</optgroup>
-      ${others.length ? `<optgroup label="Other people">${others.map(([pid, p]) => `<option value="person:${pid}">${escapeHtml(p.name)}</option>`).join('')}</optgroup>` : ''}
-      <optgroup label="Sent out">
-        <option value="site">🚚 Sent to site…</option>
-        <option value="headoffice">🏢 Head office</option>
-      </optgroup>
-      <option value="__new">+ New person…</option>
-    </select>
-    <div id="m-newname-wrap" style="display:none"><label>New person's name</label><input type="text" id="m-newname"></div>
-    <div id="m-site-wrap" style="display:none"><label>Site / job name</label>
-      <input type="text" id="m-site" list="m-site-list" placeholder="e.g. NH Hotel">
-      <datalist id="m-site-list">${sites.map(x => `<option value="${escapeHtml(x)}">`).join('')}</datalist></div>
-    <div class="sub" style="margin-top:4px">Handed out by: <b>${escapeHtml((State.currentUser && State.currentUser.username) || '—')}</b></div>`;
-}
-function wireAllocationSelect(){
-  const sel = document.getElementById('m-alloc');
-  if(!sel) return;
-  const sync = () => {
-    document.getElementById('m-newname-wrap').style.display = sel.value === '__new' ? 'block' : 'none';
-    document.getElementById('m-site-wrap').style.display = sel.value === 'site' ? 'block' : 'none';
-  };
-  sel.onchange = sync;
-  sync();
-}
-// Returns { personId, recipientType, recipientName } — or null (after a toast) if something's missing.
-function resolveAllocation(){
-  const v = document.getElementById('m-alloc').value;
-  let name, type;
-  if(v.startsWith('person:')){
-    const pid = v.slice(7);
-    return { personId: pid, recipientType: 'person', recipientName: (State.people[pid] || {}).name || '' };
-  }
-  if(v.startsWith('user:')){ name = v.slice(5); type = 'user'; }
-  else if(v === 'site'){
-    const site = document.getElementById('m-site').value.trim();
-    if(!site){ toast('Enter the site / job name', 'err'); return null; }
-    name = 'Site — ' + site; type = 'site';
-  }
-  else if(v === 'headoffice'){ name = 'Head office'; type = 'headoffice'; }
-  else {
-    name = document.getElementById('m-newname').value.trim(); type = 'person';
-    if(!name){ toast("Enter the new person's name", 'err'); return null; }
-  }
-  const existing = Object.entries(State.people || {}).find(([pid, p]) => p && (p.name || '').toLowerCase() === name.toLowerCase());
-  if(existing) return { personId: existing[0], recipientType: type, recipientName: existing[1].name };
-  const pid = uid();
-  const rec = { name };
-  if(type === 'site' || type === 'headoffice') rec.kind = type;
-  if(type === 'user') rec.kind = 'user';
-  dbRef('people/' + pid).set(rec);
-  if(!State.people) State.people = {};
-  State.people[pid] = rec;
-  return { personId: pid, recipientType: type, recipientName: name };
-}
-function currentUsername(){ return (State.currentUser && State.currentUser.username) || 'Unknown'; }
-
 function openHandOutModal(kind, id){
   const item = State.screwItems[id];
-  const name = itemName(item);
-  const word = unitWord(item);
-  openModal('Hand out ' + name, `
-    ${item.photoUrl ? `<img src="${item.photoUrl}" alt="" style="max-width:100%;max-height:160px;border-radius:8px;margin-bottom:8px;">` : ''}
-    ${allocationSelectHtml()}
-    ${locationSelectHtml('m-loc', null)}
+  const people = Object.entries(State.people || {}).sort((a,b)=> a[1].name.localeCompare(b[1].name));
+  const peopleOpts = people.map(([pid,p])=> `<option value="${pid}">${escapeHtml(p.name)}</option>`).join('');
+  openModal('Hand out ' + item.size, `
+    <label>Person</label>
+    <select id="m-person">
+      <option value="__new">+ New person…</option>
+      ${peopleOpts}
+    </select>
+    <div id="m-newname-wrap" style="display:none">
+      <label>New person's name</label>
+      <input type="text" id="m-newname">
+    </div>
     <div class="row2">
-      <div><label>Qty (${word})</label><input type="number" id="m-qty" value="1" min="1"></div>
+      <div><label>Qty (bundles)</label><input type="number" id="m-qty" value="1" min="1"></div>
       <div><label>Date</label><input type="date" id="m-date" value="${todayStr()}"></div>
     </div>
-    <div class="sub" style="margin-top:8px">Total on hand: ${escapeHtml(stockTotalLabel(item))} ${word}</div>
+    <div class="sub" style="margin-top:8px">On hand: ${item.qtyBundles} bundle(s)</div>
   `, ()=>{
     const qty = parseInt(document.getElementById('m-qty').value) || 0;
     const date = document.getElementById('m-date').value || todayStr();
-    const location = document.getElementById('m-loc').value;
+    let personSel = document.getElementById('m-person').value;
     if(qty <= 0){ toast('Enter a positive qty', 'err'); return false; }
-    const here = screwQtyAt(item, location);
-    if(qty > here){ if(!confirm('That is more than the ' + here + ' ' + word + ' on hand at ' + location + '. Continue anyway?')) return false; }
-    const alloc = resolveAllocation();
-    if(!alloc) return false;
+    if(qty > item.qtyBundles){ if(!confirm('That is more than the ' + item.qtyBundles + ' bundle(s) on hand. Continue anyway?')) return false; }
 
     const finishPersonId = (personId)=>{
-      if(!item.qtyByLocation) item.qtyByLocation = {};
-      item.qtyByLocation[location] = here - qty;
-      dbRef('screwItems/' + id + '/qtyByLocation').set(item.qtyByLocation);
-      checkReorder('screw', id, name, stockAmount(item), item.reorderQty, item.reorderSent, item.supplierId);
+      const newQty = item.qtyBundles - qty;
+      dbRef('screwItems/' + id + '/qtyBundles').set(newQty);
+      checkReorder('screw', id, item.size, newQty, item.reorderQty, item.reorderSent, item.supplierId);
       dbRef('transactions/' + uid()).set({
-        personId, itemType:'screw', itemId:id, itemLabel: name, unit: itemUnit(item), category: itemCategory(item), qty, date, month: monthKey(date),
-        recipientType: alloc.recipientType, recipientName: alloc.recipientName, handedOutBy: currentUsername(), location
+        personId, itemType:'screw', itemId:id, itemLabel: item.size, qty, date, month: monthKey(date)
       });
-      toast('Handed out ' + qty + ' ' + word + ' of ' + name + ' → ' + alloc.recipientName, 'ok');
+      toast('Handed out ' + qty + ' bundle(s) of ' + item.size, 'ok');
     };
-    finishPersonId(alloc.personId);
+
+    if(personSel === '__new'){
+      const name = document.getElementById('m-newname').value.trim();
+      if(!name){ toast('Enter a name', 'err'); return false; }
+      const newId = uid();
+      dbRef('people/' + newId).set({ name });
+      finishPersonId(newId);
+    } else {
+      finishPersonId(personSel);
+    }
     return true;
   });
-  setTimeout(wireAllocationSelect);
-}
-
-
-/* ---------- Stock Count (2026-09-24) ----------
-   Count what is physically on the shelves at one location: whole units
-   for packs/each/pairs/rolls/tins (plus how full the open roll is), and
-   litres for drum liquids. Blank = not counted. The difference shows as
-   you type; "Apply count" corrects everything counted in one go and keeps
-   a record (who, when, what changed) in countLog. Typed figures are kept
-   on this device until applied, so a count can be picked up later. */
-function consCountKey(loc){ return 'consCountDraft:' + loc; }
-function loadConsDraft(loc){ try{ return JSON.parse(localStorage.getItem(consCountKey(loc)) || '{}'); }catch(e){ return {}; } }
-function saveConsDraft(loc, d){ try{ localStorage.setItem(consCountKey(loc), JSON.stringify(d)); }catch(e){} }
-function countLoc(){
-  const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
-  if(!State.countLoc || !locations.includes(State.countLoc)) State.countLoc = locations[0];
-  return State.countLoc;
-}
-function countRows(loc){
-  const rows = [];
-  Object.entries(State.screwItems || {}).forEach(([id, item]) => {
-    rows.push({ key: 's:' + id, kind: 'item', id, item, label: itemName(item), unit: unitWord(item), cat: itemCategory(item),
-      sys: screwQtyAt(item, loc), isRoll: itemUnit(item) === 'roll', sysOpen: openRollAt(item, loc) || '' });
+  setTimeout(()=>{
+    const sel = document.getElementById('m-person');
+    const wrap = document.getElementById('m-newname-wrap');
+    sel.onchange = ()=> wrap.style.display = (sel.value==='__new') ? 'block' : 'none';
   });
-  Object.entries(State.consumableTypes || {}).filter(([tid, t]) => t.category === 'liquid').forEach(([tid, t]) => {
-    rows.push({ key: 'l:' + tid, kind: 'liquid', id: tid, item: t, label: t.name, unit: 'litres', cat: 'Liquids (by volume)',
-      sys: +(volumeAt(t, loc) / 1000).toFixed(2) });
-  });
-  const catOrder = c => { const i = ITEM_CATEGORIES.indexOf(c); return i < 0 ? 999 : i; };
-  return rows.sort((a, b) => (catOrder(a.cat) - catOrder(b.cat)) || a.label.localeCompare(b.label, undefined, { numeric: true }));
-}
-function countDiffText(row, d){
-  if(!d || (d.n === undefined && d.open === undefined)) return '—';
-  const parts = [];
-  if(d.n !== undefined){
-    const diff = +(d.n - row.sys).toFixed(2);
-    parts.push((diff > 0 ? '+' : '') + diff);
-  }
-  if(row.isRoll && d.open !== undefined && d.open !== row.sysOpen) parts.push(`open roll ${row.sysOpen || 'none'} → ${d.open || 'none'}`);
-  return parts.join(' · ') || '0';
-}
-function renderCountTab(){
-  const loc = countLoc();
-  const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
-  const draft = loadConsDraft(loc);
-  const rows = countRows(loc);
-  const wrap = el('div', '');
-  const card = el('div', 'card');
-  const recent = Object.values(State.countLog || {}).filter(c => c.location === loc).sort((a, b) => (b.ts || '').localeCompare(a.ts || ''))[0];
-  card.innerHTML = `<h2>Stock count</h2>
-    <div class="sub">Count what is physically at the location and type it in. Leave blank anything you didn't count. Nothing changes until you press <b>Apply count</b>.${recent ? `<br>Last count here: ${new Date(recent.ts).toLocaleString('en-GB')} by ${escapeHtml(recent.user)} (${recent.changes ? recent.changes.length : 0} correction(s)).` : ''}</div>
-    <label>Location</label>
-    <select id="cc-loc">${locations.map(l => `<option value="${escapeHtml(l)}" ${l === loc ? 'selected' : ''}>${escapeHtml(l)}</option>`).join('')}</select>`;
-  const table = document.createElement('table');
-  table.innerHTML = `<thead><tr><th>Item</th><th>System</th><th>Counted</th><th>Difference</th></tr></thead>`;
-  const tbody = document.createElement('tbody');
-  let lastCat = null;
-  rows.forEach(row => {
-    if(row.cat !== lastCat){
-      const hr = document.createElement('tr');
-      hr.innerHTML = `<td colspan="4" style="font-weight:700;padding-top:12px;color:var(--amber, #d59a3a);">${escapeHtml(row.cat)}</td>`;
-      tbody.appendChild(hr);
-      lastCat = row.cat;
-    }
-    const d = draft[row.key] || {};
-    const tr = document.createElement('tr');
-    const sysText = `${row.sys} ${row.unit}` + (row.isRoll ? (row.sysOpen ? ` + ${ROLL_SYMBOL[row.sysOpen]} open` : ', no open roll') : '');
-    tr.innerHTML = `<td>${escapeHtml(row.label)}</td><td class="sub">${escapeHtml(sysText)}</td>
-      <td><input type="number" min="0" step="${row.kind === 'liquid' ? '0.1' : '1'}" style="width:90px" value="${d.n !== undefined ? d.n : ''}" data-k="${row.key}">
-        ${row.isRoll ? `<select data-open="${row.key}" style="width:auto;margin-top:4px;"><option value="__same" ${d.open === undefined ? 'selected' : ''}>open roll: as is</option><option value="" ${d.open === '' ? 'selected' : ''}>no open roll</option>${ROLL_LEVELS.map(l => `<option value="${l}" ${d.open === l ? 'selected' : ''}>open roll ${ROLL_SYMBOL[l]}</option>`).join('')}</select>` : ''}</td>
-      <td id="ccd-${row.key.replace(':', '-')}">${escapeHtml(countDiffText(row, d))}</td>`;
-    tbody.appendChild(tr);
-  });
-  if(!rows.length) tbody.innerHTML = `<tr><td colspan="4" class="empty">No items to count yet.</td></tr>`;
-  table.appendChild(tbody);
-  card.appendChild(table);
-  const summary = el('div', 'sub'); summary.id = 'cc-summary'; summary.style.marginTop = '10px';
-  card.appendChild(summary);
-  const btnRow = el('div', 'btn-row');
-  const applyBtn = document.createElement('button'); applyBtn.className = 'btn btn-amber'; applyBtn.textContent = 'Apply count'; applyBtn.id = 'cc-apply';
-  applyBtn.onclick = () => applyConsCount();
-  const clearBtn = document.createElement('button'); clearBtn.className = 'btn btn-ghost'; clearBtn.textContent = 'Clear';
-  clearBtn.onclick = () => { if(confirm('Clear the figures typed for this location?')){ saveConsDraft(loc, {}); render(); } };
-  btnRow.appendChild(applyBtn); btnRow.appendChild(clearBtn);
-  card.appendChild(btnRow);
-  wrap.appendChild(card);
-
-  const byKey = Object.fromEntries(rows.map(r => [r.key, r]));
-  const refreshSummary = () => {
-    const dr = loadConsDraft(loc);
-    const keys = Object.keys(dr);
-    const changes = keys.filter(k => byKey[k] && countDiffText(byKey[k], dr[k]) !== '0' && countDiffText(byKey[k], dr[k]) !== '—').length;
-    summary.textContent = keys.length ? `${keys.length} item(s) counted · ${changes} with a difference` : 'Nothing counted yet.';
-    applyBtn.disabled = !keys.length;
-  };
-  const onEdit = (key) => {
-    const dr = loadConsDraft(loc);
-    const inp = card.querySelector(`input[data-k="${key}"]`);
-    const sel = card.querySelector(`select[data-open="${key}"]`);
-    const entry = {};
-    if(inp && inp.value !== '') entry.n = Math.max(0, parseFloat(inp.value) || 0);
-    if(sel && sel.value !== '__same') entry.open = sel.value;
-    if(Object.keys(entry).length) dr[key] = entry; else delete dr[key];
-    saveConsDraft(loc, dr);
-    const cell = card.querySelector('#ccd-' + key.replace(':', '-'));
-    if(cell) cell.textContent = countDiffText(byKey[key], entry);
-    refreshSummary();
-  };
-  setTimeout(() => {
-    card.querySelector('#cc-loc').onchange = (e) => { State.countLoc = e.target.value; render(); };
-    card.querySelectorAll('input[data-k]').forEach(i => i.oninput = () => onEdit(i.dataset.k));
-    card.querySelectorAll('select[data-open]').forEach(sl => sl.onchange = () => onEdit(sl.dataset.open));
-    refreshSummary();
-  });
-  refreshSummary();
-  return wrap;
-}
-async function applyConsCount(){
-  const loc = countLoc();
-  const draft = loadConsDraft(loc);
-  const rows = Object.fromEntries(countRows(loc).map(r => [r.key, r]));
-  const keys = Object.keys(draft).filter(k => rows[k]);
-  if(!keys.length) return;
-  if(!confirm(`Apply the count for ${keys.length} item(s) at ${loc}? Anything different will be set to the counted figure.`)) return;
-  const changes = [];
-  for(const k of keys){
-    const row = rows[k], d = draft[k];
-    if(row.kind === 'item'){
-      const item = State.screwItems[row.id];
-      if(d.n !== undefined && d.n !== row.sys){
-        const q = { ...(item.qtyByLocation || {}) }; q[loc] = Math.round(d.n);
-        await dbRef('screwItems/' + row.id + '/qtyByLocation').set(q);
-        item.qtyByLocation = q;
-        changes.push({ label: row.label, unit: row.unit, before: row.sys, after: Math.round(d.n) });
-      }
-      if(row.isRoll && d.open !== undefined && d.open !== row.sysOpen){
-        const o = { ...(item.openRollByLocation || {}) };
-        if(d.open) o[loc] = d.open; else delete o[loc];
-        await dbRef('screwItems/' + row.id + '/openRollByLocation').set(Object.keys(o).length ? o : null);
-        item.openRollByLocation = o;
-        changes.push({ label: row.label + ' (open roll)', unit: '', before: row.sysOpen || 'none', after: d.open || 'none' });
-      }
-      checkReorder('screw', row.id, row.label, stockAmount(item), item.reorderQty, item.reorderSent, item.supplierId);
-    } else if(d.n !== undefined && d.n !== row.sys){
-      const t = State.consumableTypes[row.id];
-      const v = { ...(t.volumeByLocation || {}) }; v[loc] = Math.round(d.n * 1000);
-      await dbRef('consumableTypes/' + row.id + '/volumeByLocation').set(v);
-      t.volumeByLocation = v;
-      checkReorder('consumable', row.id, t.name, totalVolumeMl(t), t.reorderLevelMl, t.reorderSent, t.supplierId, true);
-      changes.push({ label: row.label, unit: 'L', before: row.sys, after: d.n });
-    }
-  }
-  await dbRef('countLog/' + uid()).set({ ts: new Date().toISOString(), user: currentUsername(), location: loc, counted: keys.length, changes });
-  saveConsDraft(loc, {});
-  toast(changes.length ? `Count applied — ${changes.length} correction(s) at ${loc}` : `Count applied — everything matched at ${loc}`, 'ok');
-  render();
 }
 
 /* ---------- Consumables Tab (thinners / terps / wood stopping) ---------- */
-// Liquid consumables (added 2026-09-22, per user request: "change the
-// liquid to 750ml each time it gets used... restock level of 20L") —
-// tracked by total volume instead of discrete Full/3/4/1/2/1/4
-// containers, since a shared drum of thinners/glue doesn't split into
-// neat container units the way individually-bought tins do. Same
-// location-sectioning as everything else in this app.
-const DEFAULT_USE_ML = 750;
-function totalVolumeMl(type){
-  return Object.values(type.volumeByLocation || {}).reduce((a,b)=>a+(Number(b)||0), 0);
-}
-function volumeAt(type, location){
-  return (type.volumeByLocation && type.volumeByLocation[location]) || 0;
-}
-function mlToLabel(ml){
-  return ml >= 1000 ? (ml/1000).toFixed(ml % 1000 === 0 ? 0 : 1) + ' L' : ml + ' ml';
-}
-// Single source of truth for "is this consumable type low on stock" —
-// branches on category since liquid uses total volume (ml) and
-// everything else uses active-container count. Used everywhere a low-
-// stock check on a consumableType happens, so the liquid switch didn't
-// need touching every call site by hand.
-function consumableTypeQty(tid, type){
-  return type.category === 'liquid'
-    ? totalVolumeMl(type)
-    : Object.values(State.consumableUnits||{}).filter(u=>u.typeId===tid && u.fillLevel!=='Finished').length;
-}
-function consumableTypeReorderLevel(type){
-  return type.category === 'liquid' ? (type.reorderLevelMl||0) : (type.reorderQty||0);
-}
-function isConsumableTypeLow(tid, type){
-  return consumableTypeQty(tid, type) <= consumableTypeReorderLevel(type);
-}
-function renderLiquidCard(tid, type){
-  const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
-  const totalMl = totalVolumeMl(type);
-  const reorderMl = type.reorderLevelMl || 0;
-  const low = totalMl <= reorderMl;
-  const supplierName = type.supplierId && State.suppliers[type.supplierId] ? State.suppliers[type.supplierId].name : null;
-
-  const card = el('div','card');
-  const head = el('div','');
-  head.innerHTML = `
-    <h2>${thumbHtml(type.photoUrl)}${escapeHtml(type.name)} <span class="pill" style="margin-left:8px;background:#2b4a5e;color:#bfe0f5;">💧 Liquid</span> ${low ? '<span class="pill low" style="margin-left:8px">Reorder</span>' : '<span class="pill ok" style="margin-left:8px">OK</span>'}</h2>
-    <div class="sub">${mlToLabel(totalMl)} on hand · reorder at ${mlToLabel(reorderMl)}${supplierName ? ' · supplier: ' + escapeHtml(supplierName) : ''}</div>
-  `;
-  card.appendChild(head);
-
-  const table = document.createElement('table');
-  table.innerHTML = `<thead><tr><th>Location</th><th>On hand</th></tr></thead>`;
-  const tbody = document.createElement('tbody');
-  locations.forEach(loc=>{
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${escapeHtml(loc)}</td><td class="num">${mlToLabel(volumeAt(type, loc))}</td>`;
-    tbody.appendChild(tr);
-  });
-  table.appendChild(tbody);
-  card.appendChild(table);
-
-  const row = el('div','btn-row');
-  if(can('consHandOut')){
-    row.appendChild(smallBtn('Use ' + DEFAULT_USE_ML + 'ml', ()=> openUseLiquidModal(tid)));
-  }
-  if(can('consManageConsumables')){
-    row.appendChild(smallBtn('Restock', ()=> openRestockLiquidModal(tid)));
-  }
-  if(can('consManageItems')){
-    row.appendChild(smallBtn('Edit type / reorder level', ()=> openEditConsumableTypeModal(tid)));
-  }
-  card.appendChild(row);
-  return card;
-}
-
-function openUseLiquidModal(tid){
-  const type = State.consumableTypes[tid];
-  const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
-  openModal('Use ' + type.name, `
-    ${allocationSelectHtml()}
-    ${locationSelectHtml('m-loc', null)}
-    <div class="row2">
-      <div><label>Amount used (ml)</label><input type="number" id="m-ml" value="${DEFAULT_USE_ML}" min="1" step="50"></div>
-      <div><label>Date</label><input type="date" id="m-date" value="${todayStr()}"></div>
-    </div>
-    <div class="sub" style="margin-top:8px">Total on hand: ${mlToLabel(totalVolumeMl(type))}</div>
-  `, ()=>{
-    const ml = parseInt(document.getElementById('m-ml').value) || 0;
-    const date = document.getElementById('m-date').value || todayStr();
-    const location = document.getElementById('m-loc').value;
-    if(ml <= 0){ toast('Enter a positive amount', 'err'); return false; }
-    const here = volumeAt(type, location);
-    if(ml > here){ if(!confirm('That is more than the ' + mlToLabel(here) + ' on hand at ' + location + '. Continue anyway?')) return false; }
-    const alloc = resolveAllocation();
-    if(!alloc) return false;
-
-    const finishPersonId = (personId)=>{
-      if(!type.volumeByLocation) type.volumeByLocation = {};
-      type.volumeByLocation[location] = here - ml;
-      dbRef('consumableTypes/' + tid + '/volumeByLocation').set(type.volumeByLocation);
-      checkReorder('consumable', tid, type.name, totalVolumeMl(type), type.reorderLevelMl, type.reorderSent, type.supplierId, true);
-      dbRef('transactions/' + uid()).set({
-        personId, itemType:'consumable', itemId:tid, itemLabel: type.name + ' (' + ml + 'ml)', qty: ml, date, month: monthKey(date),
-        recipientType: alloc.recipientType, recipientName: alloc.recipientName, handedOutBy: currentUsername(), location
-      });
-      toast('Logged ' + ml + 'ml of ' + type.name + ' → ' + alloc.recipientName, 'ok');
-    };
-    finishPersonId(alloc.personId);
-    return true;
-  });
-  setTimeout(wireAllocationSelect);
-}
-
-function openRestockLiquidModal(tid){
-  const type = State.consumableTypes[tid];
-  openModal('Restock ' + type.name, `
-    <label>Amount to add (liters)</label>
-    <input type="number" id="m-l" value="20" min="0.1" step="0.1">
-    ${locationSelectHtml('m-loc', null)}
-  `, ()=>{
-    const liters = parseFloat(document.getElementById('m-l').value) || 0;
-    const location = document.getElementById('m-loc').value;
-    if(liters <= 0){ toast('Enter a positive amount', 'err'); return false; }
-    const ml = Math.round(liters * 1000);
-    if(!type.volumeByLocation) type.volumeByLocation = {};
-    type.volumeByLocation[location] = (type.volumeByLocation[location] || 0) + ml;
-    dbRef('consumableTypes/' + tid + '/volumeByLocation').set(type.volumeByLocation);
-    checkReorder('consumable', tid, type.name, totalVolumeMl(type), type.reorderLevelMl, type.reorderSent, type.supplierId, true);
-    toast('Restocked ' + type.name + ' with ' + mlToLabel(ml), 'ok');
-    return true;
-  });
-}
-
 function renderConsumablesTab(){
   const container = el('div','');
-  container.appendChild(renderCountedCard('consumables')); // stain tins (500 ml / 1 L)
   const types = Object.entries(State.consumableTypes || {}).sort((a,b)=> a[1].name.localeCompare(b[1].name));
 
   types.forEach(([tid, type])=>{
-    if(type.category === 'liquid'){
-      container.appendChild(renderLiquidCard(tid, type));
-      return;
-    }
     const units = Object.entries(State.consumableUnits || {}).filter(([uidk,u])=> u.typeId === tid);
     const activeCount = units.filter(([uidk,u])=> u.fillLevel !== 'Finished').length;
     const low = activeCount <= type.reorderQty;
-    const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
 
     const card = el('div','card');
     const head = el('div','');
     const supplierName = type.supplierId && State.suppliers[type.supplierId] ? State.suppliers[type.supplierId].name : null;
     head.innerHTML = `
-      <h2>${escapeHtml(type.name)} ${type.category==='liquid' ? '<span class="pill" style="margin-left:8px;background:#2b4a5e;color:#bfe0f5;">💧 Liquid</span>' : ''} ${low ? '<span class="pill low" style="margin-left:8px">Reorder</span>' : '<span class="pill ok" style="margin-left:8px">OK</span>'}</h2>
+      <h2>${escapeHtml(type.name)} ${low ? '<span class="pill low" style="margin-left:8px">Reorder</span>' : '<span class="pill ok" style="margin-left:8px">OK</span>'}</h2>
       <div class="sub">${activeCount} active container(s) · reorder at ${type.reorderQty}${supplierName ? ' · supplier: ' + escapeHtml(supplierName) : ''}</div>
     `;
     card.appendChild(head);
@@ -1578,68 +710,47 @@ function renderConsumablesTab(){
     if(units.length === 0){
       card.appendChild(elHtml('div','empty','No containers logged yet.'));
     } else {
-      // Grouped by location, per user request ("i want the same in
-      // consumables" — mirrors board-stock-app's location sections).
-      // Every unit already has its OWN location field going forward;
-      // any unit created before this change has none, so it's shown
-      // under the first location as a sensible default rather than
-      // disappearing from view.
-      const firstLoc = locations[0];
-      locations.forEach(loc => {
-        const here = units.filter(([uidk,u]) => (u.location || firstLoc) === loc);
-        if(here.length === 0) return;
-        const locHead = document.createElement('div');
-        locHead.style.cssText = 'font-weight:600;margin:14px 0 6px;font-size:13px;color:var(--amber);';
-        locHead.textContent = loc;
-        card.appendChild(locHead);
-        const table = document.createElement('table');
-        table.innerHTML = `<thead><tr><th>Container</th><th>Started</th><th>Fill level</th></tr></thead>`;
-        const tbody = document.createElement('tbody');
-        here.sort((a,b)=> (a[1].createdDate||'').localeCompare(b[1].createdDate||''));
-        here.forEach(([unitId, unit])=>{
-          const idx = units.findIndex(([k])=>k===unitId);
-          const tr = document.createElement('tr');
-          const nameTd = document.createElement('td');
-          nameTd.textContent = type.name + ' #' + (idx+1);
-          const dateTd = document.createElement('td');
-          dateTd.textContent = unit.createdDate || '—';
-          const fillTd = document.createElement('td');
-          const toggle = el('div','fill-toggle');
-          FILL_LEVELS.forEach(level=>{
-            const opt = document.createElement('button');
-            opt.className = 'fill-opt' + (unit.fillLevel===level ? ' active' + (level==='Finished' ? ' finished':'') : '');
-            opt.textContent = level;
-            opt.onclick = ()=>{
-              dbRef('consumableUnits/' + unitId + '/fillLevel').set(level);
-              setTimeout(()=>{
-                const freshUnits = Object.entries(State.consumableUnits||{}).filter(([k,u])=>u.typeId===tid);
-                const freshActive = freshUnits.filter(([k,u])=>u.fillLevel!=='Finished').length;
-                checkReorder('consumable', tid, type.name, freshActive, type.reorderQty, type.reorderSent, type.supplierId);
-              }, 150);
-            };
-            toggle.appendChild(opt);
-          });
-          fillTd.appendChild(toggle);
-          tr.appendChild(nameTd); tr.appendChild(dateTd); tr.appendChild(fillTd);
-          tbody.appendChild(tr);
+      const table = document.createElement('table');
+      table.innerHTML = `<thead><tr><th>Container</th><th>Started</th><th>Fill level</th></tr></thead>`;
+      const tbody = document.createElement('tbody');
+      units.sort((a,b)=> (a[1].createdDate||'').localeCompare(b[1].createdDate||''));
+      units.forEach(([unitId, unit], idx)=>{
+        const tr = document.createElement('tr');
+        const nameTd = document.createElement('td');
+        nameTd.textContent = type.name + ' #' + (idx+1);
+        const dateTd = document.createElement('td');
+        dateTd.textContent = unit.createdDate || '—';
+        const fillTd = document.createElement('td');
+        const toggle = el('div','fill-toggle');
+        FILL_LEVELS.forEach(level=>{
+          const opt = document.createElement('button');
+          opt.className = 'fill-opt' + (unit.fillLevel===level ? ' active' + (level==='Finished' ? ' finished':'') : '');
+          opt.textContent = level;
+          opt.onclick = ()=>{
+            dbRef('consumableUnits/' + unitId + '/fillLevel').set(level);
+            setTimeout(()=>{
+              const freshUnits = Object.entries(State.consumableUnits||{}).filter(([k,u])=>u.typeId===tid);
+              const freshActive = freshUnits.filter(([k,u])=>u.fillLevel!=='Finished').length;
+              checkReorder('consumable', tid, type.name, freshActive, type.reorderQty, type.reorderSent, type.supplierId);
+            }, 150);
+          };
+          toggle.appendChild(opt);
         });
-        table.appendChild(tbody);
-        card.appendChild(table);
+        fillTd.appendChild(toggle);
+        tr.appendChild(nameTd); tr.appendChild(dateTd); tr.appendChild(fillTd);
+        tbody.appendChild(tr);
       });
+      table.appendChild(tbody);
+      card.appendChild(table);
     }
 
-    if(can('consManageConsumables')){
+    if(can('manageConsumables')){
       const row = el('div','btn-row');
-      row.style.cssText = 'align-items:center;gap:8px;';
-      const locSel = document.createElement('select');
-      locSel.style.cssText = 'width:auto;';
-      locations.forEach(l => { const o = document.createElement('option'); o.value = l; o.textContent = l; locSel.appendChild(o); });
-      row.appendChild(locSel);
       const addUnitBtn = document.createElement('button');
       addUnitBtn.className = 'btn btn-sm btn-ghost';
       addUnitBtn.textContent = '+ New container';
       addUnitBtn.onclick = ()=>{
-        dbRef('consumableUnits/' + uid()).set({ typeId: tid, fillLevel:'Full', createdDate: todayStr(), location: locSel.value });
+        dbRef('consumableUnits/' + uid()).set({ typeId: tid, fillLevel:'Full', createdDate: todayStr() });
         setTimeout(()=>{
           const freshUnits = Object.entries(State.consumableUnits||{}).filter(([k,u])=>u.typeId===tid);
           const freshActive = freshUnits.filter(([k,u])=>u.fillLevel!=='Finished').length;
@@ -1648,7 +759,7 @@ function renderConsumablesTab(){
       };
       row.appendChild(addUnitBtn);
 
-      if(can('consManageItems')){
+      if(can('manageItems')){
         const editBtn = document.createElement('button');
         editBtn.className = 'btn btn-sm btn-ghost';
         editBtn.textContent = 'Edit type / reorder qty';
@@ -1661,104 +772,59 @@ function renderConsumablesTab(){
     container.appendChild(card);
   });
 
-  if(can('consManageItems')){
+  if(can('manageItems')){
     const addCard = el('div','card');
-    addCard.innerHTML = `<h2>Add a liquid tracked by volume</h2><div class="sub">For thinners, turps, glue — anything used from a drum and tracked in litres. Stains in 500 ml / 1 L tins go in the Tins list above.</div>`;
+    addCard.innerHTML = `<h2>Add a new item type</h2><div class="sub">For thinners, terps, wood stopping on rags, or anything else tracked by container fill level.</div>`;
     const addRow = el('div','btn-row');
     const addBtn = document.createElement('button');
     addBtn.className = 'btn btn-amber';
-    addBtn.textContent = '+ Add liquid';
+    addBtn.textContent = '+ Add item type';
     addBtn.onclick = openAddConsumableTypeModal;
     addRow.appendChild(addBtn);
     addCard.appendChild(addRow);
     container.appendChild(addCard);
   }
 
-  if(types.length === 0 && !can('consManageItems')){
+  if(types.length === 0 && !can('manageItems')){
     container.appendChild(elHtml('div','empty','No item types set up yet.'));
   }
 
   return container;
 }
 
-function categorySelectHtml(id, selected){
-  // "Liquid" added per user request ("i want a liquid button so that if
-  // or in case thinners work in 1/4 sections glue works the same") —
-  // the fill-level tracking (Full/3/4/1/2/1/4/Finished) already applies
-  // to every consumable type regardless of category; this just labels
-  // liquid items (thinners, glue, etc.) consistently so they show the
-  // same 💧 tag wherever they appear.
-  // Wood stopping / other moved to the Consumables tab as 'each' items (2026-09-24).
-  const CATEGORIES = [['liquid','💧 Liquid (thinners, turps, glue, etc.)']];
-  if(selected && selected !== 'liquid') CATEGORIES.push([selected, selected === 'stopping' ? 'Wood stopping (old)' : 'Other (old)']);
-  return `<label>Category</label><select id="${id}">${CATEGORIES.map(([v,l])=>`<option value="${v}" ${v===selected?'selected':''}>${l}</option>`).join('')}</select>`;
-}
-
 function openAddConsumableTypeModal(){
   openModal('Add item type', `
-    <label>Name (e.g. Thinners, Turps, Contact Adhesive)</label>
+    <label>Name (e.g. Thinners, Terps, Wood Stopping)</label>
     <input type="text" id="m-name">
-    ${categorySelectHtml('m-category', 'liquid')}
-    <div id="m-reorder-container">
-      <label id="m-reorder-label">Reorder level (liters)</label>
-      <input type="number" id="m-reorder" value="20" step="0.1">
-    </div>
+    <label>Reorder at (active containers)</label>
+    <input type="number" id="m-reorder" value="1">
     ${supplierSelectHtml('m-supplier', null)}
   `, ()=>{
     const name = document.getElementById('m-name').value.trim();
-    const category = document.getElementById('m-category').value;
-    const reorderVal = parseFloat(document.getElementById('m-reorder').value) || 0;
+    const reorderQty = parseInt(document.getElementById('m-reorder').value) || 0;
     const supplierId = document.getElementById('m-supplier').value || null;
     if(!name){ toast('Enter a name', 'err'); return false; }
-    if(category === 'liquid'){
-      dbRef('consumableTypes/' + uid()).set({ name, category, reorderLevelMl: Math.round(reorderVal*1000), reorderSent:false, supplierId, volumeByLocation:{} });
-    } else {
-      dbRef('consumableTypes/' + uid()).set({ name, category, reorderQty: Math.round(reorderVal), reorderSent:false, supplierId });
-    }
+    dbRef('consumableTypes/' + uid()).set({ name, reorderQty, reorderSent:false, supplierId });
     return true;
-  });
-  setTimeout(()=>{
-    const catSel = document.getElementById('m-category');
-    const updateReorderField = ()=>{
-      const isLiquid = catSel.value === 'liquid';
-      document.getElementById('m-reorder-label').textContent = isLiquid ? 'Reorder level (liters)' : 'Reorder at (active containers)';
-      document.getElementById('m-reorder').value = isLiquid ? '20' : '1';
-      document.getElementById('m-reorder').step = isLiquid ? '0.1' : '1';
-    };
-    if(catSel) catSel.onchange = updateReorderField;
   });
 }
 
 function openEditConsumableTypeModal(tid){
   const type = State.consumableTypes[tid];
-  const isLiquid = type.category === 'liquid';
   openModal('Edit ' + type.name, `
     <label>Name</label>
     <input type="text" id="m-name" value="${escapeHtml(type.name)}">
-    ${categorySelectHtml('m-category', type.category || 'liquid')}
-    <div id="m-reorder-container">
-      <label id="m-reorder-label">${isLiquid ? 'Reorder level (liters)' : 'Reorder at (active containers)'}</label>
-      <input type="number" id="m-reorder" value="${isLiquid ? (type.reorderLevelMl||0)/1000 : type.reorderQty}" step="${isLiquid?'0.1':'1'}">
-    </div>
+    <label>Reorder at (active containers)</label>
+    <input type="number" id="m-reorder" value="${type.reorderQty}">
     ${supplierSelectHtml('m-supplier', type.supplierId)}
-    ${photoFieldHtml(type.photoUrl)}
     <div class="btn-row"><button class="btn btn-danger" id="m-delete" type="button">Delete this item type</button></div>
   `, ()=>{
     const name = document.getElementById('m-name').value.trim();
-    const photo = readPhotoField();
-    if(photo.file) uploadItemPhoto('consumableTypes', tid, photo.file);
-    else if(photo.remove) dbRef('consumableTypes/' + tid + '/photoUrl').set(null);
-    const category = document.getElementById('m-category').value;
-    const reorderVal = parseFloat(document.getElementById('m-reorder').value) || 0;
+    const reorderQty = parseInt(document.getElementById('m-reorder').value) || 0;
     const supplierId = document.getElementById('m-supplier').value || null;
     if(!name){ toast('Enter a name', 'err'); return false; }
-    if(category === 'liquid'){
-      dbRef('consumableTypes/' + tid).update({ name, category, supplierId, reorderLevelMl: Math.round(reorderVal*1000), volumeByLocation: type.volumeByLocation || {} });
-      checkReorder('consumable', tid, name, totalVolumeMl(type), Math.round(reorderVal*1000), type.reorderSent, supplierId, true);
-    } else {
-      dbRef('consumableTypes/' + tid).update({ name, category, supplierId, reorderQty: Math.round(reorderVal) });
-      checkReorder('consumable', tid, name, (Object.values(State.consumableUnits||{}).filter(u=>u.typeId===tid && u.fillLevel!=='Finished').length), Math.round(reorderVal), type.reorderSent, supplierId);
-    }
+    dbRef('consumableTypes/' + tid).update({ name, reorderQty, supplierId });
+    checkReorder('consumable', tid, name, (Object.values(State.consumableUnits||{}).filter(u=>u.typeId===tid && u.fillLevel!=='Finished').length), reorderQty, type.reorderSent, supplierId);
     return true;
   });
   setTimeout(()=>{
@@ -1770,25 +836,17 @@ function openEditConsumableTypeModal(tid){
         closeModal();
       }
     };
-    const catSel = document.getElementById('m-category');
-    if(catSel) catSel.onchange = ()=>{
-      const nowLiquid = catSel.value === 'liquid';
-      document.getElementById('m-reorder-label').textContent = nowLiquid ? 'Reorder level (liters)' : 'Reorder at (active containers)';
-      document.getElementById('m-reorder').step = nowLiquid ? '0.1' : '1';
-    };
   });
 }
 
 /* ---------- People Tab ---------- */
 function renderPeopleTab(){
   const container = el('div','');
-  // Team members / people first, then sites, then Head office.
-  const kindOrder = k => ({ site: 1, headoffice: 2 })[k] || 0;
-  const people = Object.entries(State.people || {}).sort((a,b)=> (kindOrder(a[1].kind) - kindOrder(b[1].kind)) || a[1].name.localeCompare(b[1].name));
+  const people = Object.entries(State.people || {}).sort((a,b)=> a[1].name.localeCompare(b[1].name));
 
   if(people.length === 0){
     const card = el('div','card');
-    card.appendChild(elHtml('div','empty','Nothing allocated yet. Everyone you hand stock to (team members, sites, Head office) shows up here automatically.'));
+    card.appendChild(elHtml('div','empty','No people added yet. People are added automatically the first time you hand something out to them.'));
     container.appendChild(card);
   }
 
@@ -1803,8 +861,7 @@ function renderPeopleTab(){
 
     const card = el('div','card');
     const head = el('div','');
-    const icon = person.kind === 'site' ? '🚚 ' : (person.kind === 'headoffice' ? '🏢 ' : '');
-    head.innerHTML = `<h2>${icon}${escapeHtml(person.name)}</h2><div class="sub">${txns.length} item(s) allocated all-time</div>`;
+    head.innerHTML = `<h2>${escapeHtml(person.name)}</h2><div class="sub">${txns.length} item(s) taken all-time</div>`;
     card.appendChild(head);
 
     if(months.length === 0){
@@ -1820,11 +877,11 @@ function renderPeopleTab(){
         details.appendChild(summary);
         const body = el('div','body');
         const table = document.createElement('table');
-        table.innerHTML = `<thead><tr><th>Date</th><th>Item</th><th>Qty</th><th>Handed out by</th></tr></thead>`;
+        table.innerHTML = `<thead><tr><th>Date</th><th>Item</th><th>Qty</th></tr></thead>`;
         const tbody = document.createElement('tbody');
         list.sort((a,b)=> a.date.localeCompare(b.date)).forEach(t=>{
           const tr = document.createElement('tr');
-          tr.innerHTML = `<td>${t.date}</td><td>${escapeHtml(t.itemLabel)}</td><td class="num">${t.qty}</td><td>${escapeHtml(t.handedOutBy || '—')}</td>`;
+          tr.innerHTML = `<td>${t.date}</td><td>${escapeHtml(t.itemLabel)}</td><td class="num">${t.qty}</td>`;
           tbody.appendChild(tr);
         });
         table.appendChild(tbody);
@@ -1834,7 +891,7 @@ function renderPeopleTab(){
       });
     }
 
-    if(can('consManageItems')){
+    if(can('manageItems')){
       const row = el('div','btn-row');
       const delBtn = smallBtn('Remove person', ()=>{
         if(confirm('Remove ' + person.name + '? Their history will be kept but unlinked.')){
@@ -1854,22 +911,6 @@ function renderPeopleTab(){
 /* ---------- Reports / Export Tab ---------- */
 function renderReportsTab(){
   const container = el('div','');
-
-  const pdfCard = el('div','card');
-  pdfCard.style.marginBottom = '18px';
-  pdfCard.innerHTML = `<h2>Stock Report</h2><div class="sub">A snapshot of current screw and consumable stock levels, any time — handy to print or hand to someone.</div>`;
-  if(can('consExportExcel')){
-    const row = el('div','btn-row');
-    const pdfBtn = document.createElement('button');
-    pdfBtn.className = 'btn btn-amber';
-    pdfBtn.id = 'share-stock-pdf-btn';
-    pdfBtn.textContent = 'Print / Share PDF';
-    pdfBtn.onclick = generateAndShareStockPdf;
-    row.appendChild(pdfBtn);
-    pdfCard.appendChild(row);
-  }
-  container.appendChild(pdfCard);
-
   const card = el('div','card');
   card.innerHTML = `<h2>Export to Excel</h2><div class="sub">Export handout history for one person, or everyone, for a given month.</div>`;
 
@@ -1897,7 +938,7 @@ function renderReportsTab(){
   `;
   card.appendChild(formWrap);
 
-  if(can('consExportExcel')){
+  if(can('exportExcel')){
     const row = el('div','btn-row');
     const exportBtn = document.createElement('button');
     exportBtn.className = 'btn btn-amber';
@@ -1914,112 +955,32 @@ function renderReportsTab(){
   container.appendChild(card);
 
   // Live low-stock summary, useful alongside reports
-  if(!can('consViewReports')) return container;
   const stockCard = el('div','card');
   stockCard.innerHTML = `<h2>Items at or below reorder level</h2>`;
-  const lowScrews = Object.values(State.screwItems||{}).filter(i=> stockAmount(i) <= i.reorderQty);
-  const lowConsList = Object.entries(State.consumableTypes||{}).filter(([tid,t])=> isConsumableTypeLow(tid, t));
+  const lowScrews = Object.values(State.screwItems||{}).filter(i=> i.qtyBundles <= i.reorderQty);
+  const lowCons = Object.values(State.consumableTypes||{}).filter(t=>{
+    const active = Object.values(State.consumableUnits||{}).filter(u=>u.typeId && State.consumableTypes[Object.keys(State.consumableTypes).find(k=>State.consumableTypes[k]===t)]).length;
+    return true; // recalculated properly below
+  });
+  const lowConsList = Object.entries(State.consumableTypes||{}).filter(([tid,t])=>{
+    const active = Object.values(State.consumableUnits||{}).filter(u=>u.typeId===tid && u.fillLevel!=='Finished').length;
+    return active <= t.reorderQty;
+  });
   if(lowScrews.length===0 && lowConsList.length===0){
     stockCard.appendChild(elHtml('div','empty','Nothing currently needs reordering.'));
   } else {
     const ul = document.createElement('ul');
     ul.style.margin = '0'; ul.style.paddingLeft = '18px'; ul.style.fontSize='13.5px';
-    lowScrews.forEach(i=>{ const li=document.createElement('li'); li.textContent = `${itemName(i)} — ${stockTotalLabel(i)} ${unitWord(i)} left`; ul.appendChild(li); });
+    lowScrews.forEach(i=>{ const li=document.createElement('li'); li.textContent = `${i.size} — ${i.qtyBundles} bundle(s) left`; ul.appendChild(li); });
     lowConsList.forEach(([tid,t])=>{
-      const li=document.createElement('li');
-      li.textContent = t.category === 'liquid'
-        ? `${t.name} — ${mlToLabel(totalVolumeMl(t))} left`
-        : `${t.name} — ${consumableTypeQty(tid,t)} active container(s) left`;
-      ul.appendChild(li);
+      const active = Object.values(State.consumableUnits||{}).filter(u=>u.typeId===tid && u.fillLevel!=='Finished').length;
+      const li=document.createElement('li'); li.textContent = `${t.name} — ${active} active container(s) left`; ul.appendChild(li);
     });
     stockCard.appendChild(ul);
   }
   container.appendChild(stockCard);
 
   return container;
-}
-
-/* Stock report PDF (added 2026-09-23, per user request: "is it setup to
-   pull stock levels...to hand in to my superiors" — mirrors Stock List's
-   own Print/Share PDF). Two tables: screws, then consumable types
-   (liquid volumes and container counts both shown in their own units). */
-function buildStockPdfBlob(){
-  const { jsPDF } = window.jspdf;
-  const doc = new jsPDF();
-  const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
-
-  doc.setFontSize(16);
-  doc.setFont(undefined, 'bold');
-  doc.text('Fixings & Finishing Stock Report', 14, 18);
-  doc.setFontSize(9);
-  doc.setFont(undefined, 'normal');
-  doc.text('Generated ' + new Date().toLocaleString(), 14, 24);
-
-  let y = 32;
-  const screws = Object.values(State.screwItems || {}).sort((a,b)=> itemName(a).localeCompare(itemName(b), undefined, {numeric:true}));
-  if(screws.length > 0){
-    const rows = screws.map(item => {
-      const breakdown = locations.map(l => `${l}: ${stockAtLabel(item,l)}`).join('  ·  ');
-      return [itemName(item), unitLabel(item), breakdown, stockTotalLabel(item), item.reorderQty];
-    });
-    doc.autoTable({
-      startY: y,
-      head: [['Consumables & tins', 'Unit', 'By location', 'Total', 'Reorder at']],
-      body: rows,
-      styles: { fontSize: 8, cellPadding: 2 },
-      headStyles: { fillColor: [184, 121, 31] },
-      margin: { left: 14, right: 14 },
-    });
-    y = doc.lastAutoTable.finalY + 8;
-  }
-
-  const types = Object.entries(State.consumableTypes || {}).sort((a,b)=> a[1].name.localeCompare(b[1].name));
-  if(types.length > 0){
-    const rows = types.map(([tid, type]) => {
-      if(type.category === 'liquid'){
-        const breakdown = locations.map(l => `${l}: ${mlToLabel(volumeAt(type,l))}`).join('  ·  ');
-        return [type.name + ' (Liquid)', breakdown, mlToLabel(totalVolumeMl(type)), mlToLabel(type.reorderLevelMl||0)];
-      }
-      const active = Object.values(State.consumableUnits||{}).filter(u=>u.typeId===tid && u.fillLevel!=='Finished').length;
-      return [type.name, '—', active + ' container(s)', (type.reorderQty||0) + ' container(s)'];
-    });
-    if(y > 250){ doc.addPage(); y = 20; }
-    doc.autoTable({
-      startY: y,
-      head: [['Consumable', 'By location', 'Total on hand', 'Reorder at']],
-      body: rows,
-      styles: { fontSize: 8, cellPadding: 2 },
-      headStyles: { fillColor: [184, 121, 31] },
-      margin: { left: 14, right: 14 },
-    });
-  }
-
-  return doc.output('blob');
-}
-async function generateAndShareStockPdf(){
-  if(!can('consExportExcel')) return;
-  const btn = document.getElementById('share-stock-pdf-btn');
-  const original = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = 'Preparing PDF…';
-  try{
-    const blob = buildStockPdfBlob();
-    const file = new File([blob], 'consumables-stock-report.pdf', { type: 'application/pdf' });
-    if(navigator.canShare && navigator.canShare({ files: [file] })){
-      await navigator.share({ files: [file], title: 'Consumables Stock Report', text: 'Consumables stock report — ' + new Date().toLocaleDateString() });
-    } else {
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = 'consumables-stock-report.pdf';
-      document.body.appendChild(a); a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    }
-  } catch(e){
-    if(e.name !== 'AbortError') toast('Could not generate the PDF.', 'err');
-  }
-  btn.disabled = false;
-  btn.textContent = original;
 }
 
 function exportToExcel(personSel, monthSel){
@@ -2030,13 +991,10 @@ function exportToExcel(personSel, monthSel){
   const rows = txns.sort((a,b)=> a.date.localeCompare(b.date)).map(t=>({
     Date: t.date,
     Month: monthLabel(t.month),
-    'Allocated to': t.recipientName || (State.people[t.personId] && State.people[t.personId].name) || 'Unknown',
-    'Allocation type': ({ user: 'Team member', person: 'Person', site: 'Sent to site', headoffice: 'Head office' })[t.recipientType] || 'Person',
-    'Handed out by': t.handedOutBy || '',
+    Person: (State.people[t.personId] && State.people[t.personId].name) || 'Unknown',
     Item: t.itemLabel,
-    Type: t.itemType === 'screw' ? (t.category || (State.screwItems[t.itemId] ? itemCategory(State.screwItems[t.itemId]) : 'Consumables')) : 'Liquid',
-    Qty: t.qty,
-    Unit: t.itemType === 'screw' ? (ITEM_UNITS[t.unit] ? ITEM_UNITS[t.unit].word : 'bundle(s)') : 'ml'
+    Type: t.itemType === 'screw' ? 'Screws' : 'Consumable',
+    Qty: t.qty
   }));
 
   if(rows.length === 0){ toast('Nothing to export for that selection', 'err'); return; }
@@ -2050,122 +1008,6 @@ function exportToExcel(personSel, monthSel){
 }
 
 /* ---------- Suppliers Tab ---------- */
-/* ---------------- SEND TO DISPATCH (added 2026-09-22, per user request:
-   "i want a section off sending from consumables to dispatch"). Mirrors
-   Board Stock Take's own version of this: deducts stock here (either a
-   screw size or a liquid) and creates a matching Unfinished item
-   directly in the Dispatch app's own board data, reversible from there
-   with "Return to stock" via recipeSnapshot.sourceApp:'consumablesStock'.
-   Non-liquid consumables (wood stopping, tracked by discrete containers
-   rather than a number) aren't offered here — there's no clean "qty" to
-   deduct for those the way there is for screw bundles or liquid ml. ---------------- */
-function renderSendToDispatchTab(){
-  const wrap = el('div','');
-  const screws = Object.entries(State.screwItems||{}).sort((a,b)=> itemName(a[1]).localeCompare(itemName(b[1]), undefined, {numeric:true}));
-  const liquids = Object.entries(State.consumableTypes||{}).filter(([tid,t])=> t.category==='liquid').sort((a,b)=> a[1].name.localeCompare(b[1].name));
-  const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
-
-  const card = el('div','card');
-  card.innerHTML = `<h2>Send to Dispatch</h2><div class="sub">Deducts stock here and creates a matching item in the Dispatch app's Unfinished column. Can be undone from there with "Return to stock".</div>`;
-
-  const kindWrap = document.createElement('div');
-  kindWrap.innerHTML = `
-    <label>Type</label>
-    <select id="sd-kind">
-      <option value="screw">Consumables & tins</option>
-      <option value="liquid">Liquid (by volume)</option>
-    </select>
-    <label>Location</label>
-    <select id="sd-loc">${locations.map(l=>`<option value="${escapeHtml(l)}">${escapeHtml(l)}</option>`).join('')}</select>
-    <div id="sd-item-wrap"></div>
-    <label id="sd-qty-label">Quantity</label>
-    <input type="number" id="sd-qty" value="1" min="1">
-    <label>Reference / job</label>
-    <input type="text" id="sd-ref" placeholder="e.g. NH Hotel">
-    <div class="btn-row"><button class="btn btn-amber" id="sd-submit" style="width:100%">Send to Dispatch</button></div>
-  `;
-  card.appendChild(kindWrap);
-  wrap.appendChild(card);
-
-  const refreshItemSelect = ()=>{
-    const kind = document.getElementById('sd-kind').value;
-    const itemWrap = document.getElementById('sd-item-wrap');
-    if(kind === 'screw'){
-      itemWrap.innerHTML = `<label>Item</label><select id="sd-item">${screws.map(([id,s])=>`<option value="${id}">${escapeHtml(itemName(s))} (on hand: ${escapeHtml(stockTotalLabel(s))} ${unitWord(s)})</option>`).join('') || '<option value="">No items yet</option>'}</select>`;
-      const setQtyLabel = ()=>{ const it = State.screwItems[document.getElementById('sd-item').value]; document.getElementById('sd-qty-label').textContent = 'Quantity (' + (it ? unitWord(it) : 'bundles') + ')'; };
-      document.getElementById('sd-item').onchange = setQtyLabel;
-      setQtyLabel();
-    } else {
-      itemWrap.innerHTML = `<label>Liquid</label><select id="sd-item">${liquids.map(([id,t])=>`<option value="${id}">${escapeHtml(t.name)} (on hand: ${mlToLabel(totalVolumeMl(t))})</option>`).join('') || '<option value="">No liquids yet</option>'}</select>`;
-      document.getElementById('sd-qty-label').textContent = 'Quantity (ml)';
-    }
-  };
-  setTimeout(()=>{
-    refreshItemSelect();
-    document.getElementById('sd-kind').onchange = refreshItemSelect;
-    document.getElementById('sd-submit').onclick = submitSendToDispatch;
-  });
-
-  return wrap;
-}
-
-async function submitSendToDispatch(){
-  if(!can('consSendToDispatch')) return;
-  const kind = document.getElementById('sd-kind').value;
-  const itemId = document.getElementById('sd-item').value;
-  const location = document.getElementById('sd-loc').value;
-  const qty = parseInt(document.getElementById('sd-qty').value, 10);
-  const ref = document.getElementById('sd-ref').value.trim();
-  if(!itemId){ toast('Choose an item first', 'err'); return; }
-  if(!qty || qty <= 0){ toast('Enter a valid quantity', 'err'); return; }
-  if(!State.dispatchBoardRef){ toast('Not connected to the Dispatch app yet — try again in a moment.', 'err'); return; }
-
-  let label, here, deductRef, deductObjKey;
-  if(kind === 'screw'){
-    const item = State.screwItems[itemId];
-    if(!item){ toast('That item no longer exists', 'err'); return; }
-    label = itemName(item);
-    here = screwQtyAt(item, location);
-    if(qty > here && !confirm(`Only ${here} ${unitWord(item)} on hand at ${location} — send anyway? Stock will show as negative there.`)) return;
-    if(!item.qtyByLocation) item.qtyByLocation = {};
-    item.qtyByLocation[location] = here - qty;
-    await dbRef('screwItems/' + itemId + '/qtyByLocation').set(item.qtyByLocation);
-    checkReorder('screw', itemId, label, stockAmount(item), item.reorderQty, item.reorderSent, item.supplierId);
-  } else {
-    const type = State.consumableTypes[itemId];
-    if(!type){ toast('That liquid no longer exists', 'err'); return; }
-    label = type.name;
-    here = volumeAt(type, location);
-    if(qty > here && !confirm(`Only ${mlToLabel(here)} on hand at ${location} — send anyway? Stock will show as negative there.`)) return;
-    if(!type.volumeByLocation) type.volumeByLocation = {};
-    type.volumeByLocation[location] = here - qty;
-    await dbRef('consumableTypes/' + itemId + '/volumeByLocation').set(type.volumeByLocation);
-    checkReorder('consumable', itemId, label, totalVolumeMl(type), type.reorderLevelMl, type.reorderSent, type.supplierId, true);
-  }
-
-  try{
-    // Atomic append (transaction) — a plain read-then-overwrite could
-    // wipe out a Dispatch change someone else saved in the same moment.
-    const today = new Date().toLocaleDateString('en-GB', {day:'2-digit', month:'long', year:'numeric'});
-    const newItem = {
-      id: uid(), type: label + (kind==='liquid' ? ' (' + qty + 'ml)' : (' (' + unitWord(State.screwItems[itemId] || {}) + ')')), qty, ref,
-      status: 'unvinaged',
-      addedDate: today, vinagedDate: null, readyDate: null, dispatchedDate: null, noteId: null,
-      recipeSnapshot: [{ sourceApp: 'consumablesStock', kind, itemId, desc: label, deductQty: qty, location }]
-    };
-    await State.dispatchBoardRef.child('items').transaction(current => {
-      const items = Array.isArray(current) ? current : (current && typeof current === 'object' ? Object.values(current) : []);
-      items.push(newItem);
-      return items;
-    });
-    toast(`Sent ${qty}${kind==='liquid'?'ml':''} of ${label} to Dispatch.`, 'ok');
-    document.getElementById('sd-qty').value = '1';
-    document.getElementById('sd-ref').value = '';
-  } catch(e){
-    toast('Could not reach the Dispatch app — check your connection and try again.', 'err');
-  }
-}
-
 function renderSuppliersTab(){
   const container = el('div','');
   const suppliers = Object.entries(State.suppliers || {}).sort((a,b)=> a[1].name.localeCompare(b[1].name));
@@ -2182,8 +1024,12 @@ function renderSuppliersTab(){
     suppliers.forEach(([sid, s])=>{
       const screwCount = Object.values(State.screwItems||{}).filter(i=> i.supplierId===sid).length;
       const consCount = Object.values(State.consumableTypes||{}).filter(t=> t.supplierId===sid).length;
-      const lowCount = Object.values(State.screwItems||{}).filter(i=> i.supplierId===sid && stockAmount(i)<=i.reorderQty).length +
-        Object.entries(State.consumableTypes||{}).filter(([tid,t])=> t.supplierId===sid && isConsumableTypeLow(tid, t)).length;
+      const lowCount = Object.values(State.screwItems||{}).filter(i=> i.supplierId===sid && i.qtyBundles<=i.reorderQty).length +
+        Object.entries(State.consumableTypes||{}).filter(([tid,t])=>{
+          if(t.supplierId!==sid) return false;
+          const active = Object.values(State.consumableUnits||{}).filter(u=>u.typeId===tid && u.fillLevel!=='Finished').length;
+          return active <= t.reorderQty;
+        }).length;
       const tr = document.createElement('tr');
       tr.innerHTML = `
         <td>${escapeHtml(s.name)}</td>
@@ -2194,7 +1040,7 @@ function renderSuppliersTab(){
         <td></td>
       `;
       const actionsTd = tr.lastElementChild;
-      if(can('consManageItems')){
+      if(can('manageItems')){
         actionsTd.appendChild(smallBtn('Edit', ()=> openEditSupplierModal(sid)));
         const sendBtn = smallBtn('Send reorder email now', ()=> sendReorderEmailNowForSupplier(sid));
         sendBtn.style.marginLeft = '6px';
@@ -2206,7 +1052,7 @@ function renderSuppliersTab(){
     card.appendChild(table);
   }
 
-  if(can('consManageItems')){
+  if(can('manageItems')){
     const row = el('div','btn-row');
     const addBtn = document.createElement('button');
     addBtn.className = 'btn btn-amber';
@@ -2230,15 +1076,13 @@ function openAddSupplierModal(){
     <input type="text" id="m-email">
     <label>CC email (optional)</label>
     <input type="text" id="m-cc">
-    <label style="display:flex;align-items:center;gap:7px;font-weight:400;margin-top:10px;"><input type="checkbox" id="m-direct" style="width:auto;"> Send the weekly digest straight to this supplier (skip reviewing it yourself first)</label>
   `, ()=>{
     const name = document.getElementById('m-name').value.trim();
     const contactPerson = document.getElementById('m-contact').value.trim();
     const email = document.getElementById('m-email').value.trim();
     const ccEmail = document.getElementById('m-cc').value.trim();
-    const sendDirect = document.getElementById('m-direct').checked;
     if(!name){ toast('Enter a supplier name', 'err'); return false; }
-    dbRef('suppliers/' + uid()).set({ name, contactPerson, email, ccEmail, sendDirect });
+    dbRef('suppliers/' + uid()).set({ name, contactPerson, email, ccEmail });
     return true;
   });
 }
@@ -2254,16 +1098,14 @@ function openEditSupplierModal(sid){
     <input type="text" id="m-email" value="${escapeHtml(s.email||'')}">
     <label>CC email (optional)</label>
     <input type="text" id="m-cc" value="${escapeHtml(s.ccEmail||'')}">
-    <label style="display:flex;align-items:center;gap:7px;font-weight:400;margin-top:10px;"><input type="checkbox" id="m-direct" style="width:auto;" ${s.sendDirect?'checked':''}> Send the weekly digest straight to this supplier (skip reviewing it yourself first)</label>
     <div class="btn-row"><button class="btn btn-danger" id="m-delete" type="button">Delete this supplier</button></div>
   `, ()=>{
     const name = document.getElementById('m-name').value.trim();
     const contactPerson = document.getElementById('m-contact').value.trim();
     const email = document.getElementById('m-email').value.trim();
     const ccEmail = document.getElementById('m-cc').value.trim();
-    const sendDirect = document.getElementById('m-direct').checked;
     if(!name){ toast('Enter a supplier name', 'err'); return false; }
-    dbRef('suppliers/' + sid).update({ name, contactPerson, email, ccEmail, sendDirect });
+    dbRef('suppliers/' + sid).update({ name, contactPerson, email, ccEmail });
     return true;
   });
   setTimeout(()=>{
@@ -2282,29 +1124,26 @@ function openEditSupplierModal(sid){
 /* ---------- Admin Tab ---------- */
 function renderAdminTab(){
   const container = el('div','');
-  const users = [...State.sharedUsers].sort((a,b)=> a.username.localeCompare(b.username));
-  const iAmMainRoot = currentUserIsMainRoot();
+  const users = Object.entries(State.users || {}).sort((a,b)=> a[1].username.localeCompare(b[1].username));
 
   const card = el('div','card');
-  card.innerHTML = `<h2>Users</h2><div class="sub">Same shared team as your other Oak Joinery apps. Manage who can log in and what each person can do.</div>`;
+  card.innerHTML = `<h2>Users</h2><div class="sub">Manage who can log in and what each person can do.</div>`;
   const table = document.createElement('table');
-  table.innerHTML = `<thead><tr><th>Username</th><th>Role</th><th>Apps</th><th></th></tr></thead>`;
+  table.innerHTML = `<thead><tr><th>Username</th><th>Role</th><th></th></tr></thead>`;
   const tbody = document.createElement('tbody');
-  users.forEach(u=>{
+  users.forEach(([id,u])=>{
     const tr = document.createElement('tr');
-    const roleLabel = isMainRoot(u) ? 'Main root' : (u.isRoot ? 'Root' : 'Standard');
-    const appsLabel = isMainRoot(u) ? 'All apps' : Object.keys(APP_LABELS).filter(a=>userHasApp(u,a)).map(a=>APP_LABELS[a]).join(', ') || 'No apps';
-    tr.innerHTML = `<td>${escapeHtml(u.username)}</td><td>${roleLabel}</td><td class="sub" style="font-size:12px;">${escapeHtml(appsLabel)}</td><td></td>`;
+    tr.innerHTML = `<td>${escapeHtml(u.username)}</td><td>${u.isRoot ? 'Root' : 'Standard'}</td><td></td>`;
     const actionsTd = tr.lastElementChild;
-    if(can('manageUsers') && !(isMainRoot(u) && !iAmMainRoot)){
-      actionsTd.appendChild(smallBtn('Edit', ()=> openEditUserModal(u.id)));
+    if(State.currentUser.isRoot){
+      actionsTd.appendChild(smallBtn('Edit', ()=> openEditUserModal(id)));
     }
     tbody.appendChild(tr);
   });
   table.appendChild(tbody);
   card.appendChild(table);
 
-  if(can('manageUsers')){
+  if(State.currentUser.isRoot){
     const row = el('div','btn-row');
     const addBtn = document.createElement('button');
     addBtn.className = 'btn btn-amber';
@@ -2314,52 +1153,6 @@ function renderAdminTab(){
     card.appendChild(row);
   }
   container.appendChild(card);
-
-  if(State.currentUser.isRoot){
-    const locCard = el('div','card');
-    const locations = (State.locations && State.locations.length) ? State.locations : ['Main'];
-    locCard.innerHTML = `<h2>Locations</h2><div class="sub">Where screws and consumable containers are physically kept — each shows as its own section on the Consumables and Liquid tabs.</div>`;
-    const locList = el('div','stack');
-    locations.forEach((l, i) => {
-      const row = el('div','user-row');
-      const nameDiv = document.createElement('div');
-      nameDiv.style.fontWeight = '600';
-      nameDiv.textContent = l;
-      row.appendChild(nameDiv);
-      if(locations.length > 1){
-        row.appendChild(smallBtn('Remove', async ()=>{
-          const boardsHere = Object.values(State.screwItems||{}).some(item => screwQtyAt(item, l) > 0)
-            || Object.values(State.consumableUnits||{}).some(u => (u.location || locations[0]) === l && u.fillLevel !== 'Finished');
-          if(boardsHere && !confirm(`Some stock is still recorded at "${l}". Remove this location anyway? That stock will no longer be shown anywhere.`)) return;
-          const newLocations = locations.filter((x,idx)=>idx!==i);
-          await dbRef('meta').update({ locations: newLocations });
-          toast(l + ' removed.', 'ok');
-        }));
-      }
-      locList.appendChild(row);
-    });
-    locCard.appendChild(locList);
-    const addRow = el('div','btn-row');
-    const nameInput = document.createElement('input');
-    nameInput.placeholder = 'e.g. Sandton';
-    nameInput.style.width = 'auto';
-    nameInput.style.flex = '1';
-    const addBtn2 = document.createElement('button');
-    addBtn2.className = 'btn btn-amber';
-    addBtn2.textContent = 'Add location';
-    addBtn2.onclick = async ()=>{
-      const name = nameInput.value.trim();
-      if(!name){ toast('Enter a location name', 'err'); return; }
-      if(locations.some(l=>l.toLowerCase()===name.toLowerCase())){ toast('That location already exists', 'err'); return; }
-      await dbRef('meta').update({ locations: [...locations, name] });
-      nameInput.value = '';
-      toast(name + ' added.', 'ok');
-    };
-    addRow.appendChild(nameInput);
-    addRow.appendChild(addBtn2);
-    locCard.appendChild(addRow);
-    container.appendChild(locCard);
-  }
 
   if(State.currentUser.isRoot){
     const shareCard = el('div','card');
@@ -2397,14 +1190,9 @@ function renderAdminTab(){
         CONFIG.EMAILJS_SERVICE_ID = document.getElementById('ec-service').value.trim();
         CONFIG.EMAILJS_TEMPLATE_ID = document.getElementById('ec-template').value.trim();
         CONFIG.EMAILJS_PUBLIC_KEY = document.getElementById('ec-key').value.trim();
-        dbRef('meta').set({
-          reorderEmail: CONFIG.REORDER_EMAIL,
-          emailjsServiceId: CONFIG.EMAILJS_SERVICE_ID,
-          emailjsTemplateId: CONFIG.EMAILJS_TEMPLATE_ID,
-          emailjsPublicKey: CONFIG.EMAILJS_PUBLIC_KEY
-        });
+        saveConfig(CONFIG);
         if(CONFIG.EMAILJS_PUBLIC_KEY){ try{ emailjs.init(CONFIG.EMAILJS_PUBLIC_KEY); }catch(e){} }
-        toast('Email settings saved — shared with every device', 'ok');
+        toast('Email settings saved on this device', 'ok');
       };
     });
   }
@@ -2412,127 +1200,89 @@ function renderAdminTab(){
   return container;
 }
 
-function appAccessChecklistHtml(prefix, apps, iAmMainRoot){
-  return `<label>Which apps can they use?${iAmMainRoot?'':' (main root only)'}</label>
-    <div class="checklist" style="${iAmMainRoot?'':'opacity:.5;'}">
-      ${Object.keys(APP_LABELS).map(a=>`<label><input type="checkbox" class="${prefix}-app" data-app="${a}" ${apps[a]?'checked':''} ${iAmMainRoot?'':'disabled'}> ${APP_LABELS[a]}</label>`).join('')}
-    </div>`;
-}
-function readAppAccessChecklist(prefix, iAmMainRoot, existing){
-  if(!iAmMainRoot) return existing || defaultApps();
-  const apps = {};
-  document.querySelectorAll('.'+prefix+'-app').forEach(cb=>{ apps[cb.dataset.app] = cb.checked; });
-  return apps;
-}
-
 function openAddUserModal(){
-  const iAmMainRoot = currentUserIsMainRoot();
   openModal('Add user', `
     <label>Username</label>
     <input type="text" id="m-username">
-    <label>PIN (at least 4 characters)</label>
-    <input type="text" id="m-pin">
+    <label>PIN (4 digits)</label>
+    <input type="text" id="m-pin" inputmode="numeric">
     <label>Email signature (pasted from your Outlook signature — used to sign reorder emails)</label>
     <textarea id="m-signature" rows="4" style="width:100%;background:var(--bg);border:1px solid var(--line);color:var(--text);padding:8px 10px;border-radius:7px;font-size:14px;font-family:var(--sans);"></textarea>
-    <label><input type="checkbox" id="m-isroot" style="width:auto;display:inline-block;margin-right:6px"> Root user (full access to their apps, manages other users)</label>
-    ${appAccessChecklistHtml('nu', defaultApps(), iAmMainRoot)}
+    <label><input type="checkbox" id="m-isroot" style="width:auto;display:inline-block;margin-right:6px"> Root user (full access, manages other users)</label>
     <div id="m-perms-wrap">
-      <label>What can they do in this app?</label>
+      <label>Permissions</label>
       <div class="checklist">
-        <label><input type="checkbox" id="p-consHandOut" checked> Hand out items</label>
-        <label><input type="checkbox" id="p-consManageConsumables" checked> Update container fill levels</label>
-        <label><input type="checkbox" id="p-consManageItems"> Add/edit items &amp; reorder levels</label>
-        <label><input type="checkbox" id="p-consViewReports" checked> View reports</label>
-        <label><input type="checkbox" id="p-consExportExcel" checked> Export to Excel</label>
-        <label><input type="checkbox" id="p-consSendToDispatch"> Send to Dispatch</label>
+        <label><input type="checkbox" id="p-handOut" checked> Hand out items</label>
+        <label><input type="checkbox" id="p-manageConsumables" checked> Update container fill levels</label>
+        <label><input type="checkbox" id="p-manageItems"> Add/edit items &amp; reorder levels</label>
+        <label><input type="checkbox" id="p-viewReports" checked> View reports</label>
+        <label><input type="checkbox" id="p-exportExcel" checked> Export to Excel</label>
       </div>
     </div>
-  `, async ()=>{
+  `, ()=>{
     const username = document.getElementById('m-username').value.trim();
-    const pin = document.getElementById('m-pin').value;
+    const pin = document.getElementById('m-pin').value.trim();
     const signature = document.getElementById('m-signature').value.trim();
     const isRoot = document.getElementById('m-isroot').checked;
-    if(!username || pin.length < 4){ toast('Enter a username and a PIN of at least 4 characters', 'err'); return false; }
-    if(State.sharedUsers.some(u=>u.username.toLowerCase()===username.toLowerCase())){
+    if(!username || !pin){ toast('Enter a username and PIN', 'err'); return false; }
+    if(Object.values(State.users||{}).some(u=>u.username.toLowerCase()===username.toLowerCase())){
       toast('That username is taken', 'err'); return false;
     }
-    const permissions = {
-      consHandOut: document.getElementById('p-consHandOut').checked,
-      consManageConsumables: document.getElementById('p-consManageConsumables').checked,
-      consManageItems: document.getElementById('p-consManageItems').checked,
-      consViewReports: document.getElementById('p-consViewReports').checked,
-      consExportExcel: document.getElementById('p-consExportExcel').checked,
-      consSendToDispatch: document.getElementById('p-consSendToDispatch').checked,
+    const perms = {
+      handOut: document.getElementById('p-handOut').checked,
+      manageConsumables: document.getElementById('p-manageConsumables').checked,
+      manageItems: document.getElementById('p-manageItems').checked,
+      viewReports: document.getElementById('p-viewReports').checked,
+      exportExcel: document.getElementById('p-exportExcel').checked,
       manageUsers: false
     };
-    const apps = readAppAccessChecklist('nu', iAmMainRoot, null);
-    State.sharedUsers.push({ id: uid(), username, pin: await hashPin(pin), consEmailSignature: signature, isRoot, permissions, apps });
-    await saveSharedUsers();
+    dbRef('users/' + uid()).set({ username, pin, signature, isRoot, perms });
     return true;
   });
 }
 
 function openEditUserModal(id){
-  const u = State.sharedUsers.find(x=>x.id===id);
-  if(!u) return;
-  if(isMainRoot(u) && !currentUserIsMainRoot()){ toast('Only the main root account can edit itself.', 'err'); return; }
-  const iAmMainRoot = currentUserIsMainRoot();
-  const perms = u.permissions || DEFAULT_PERMS;
-  const apps = u.apps || defaultApps();
+  const u = State.users[id];
+  const perms = u.perms || DEFAULT_PERMS;
   openModal('Edit ' + u.username, `
     <label>Username</label>
     <input type="text" id="m-username" value="${escapeHtml(u.username)}">
     <label>PIN</label>
-    <input type="text" id="m-pin" placeholder="Leave blank to keep current PIN">
+    <input type="text" id="m-pin" value="${escapeHtml(String(u.pin))}" inputmode="numeric">
     <label>Email signature (pasted from your Outlook signature — used to sign reorder emails)</label>
-    <textarea id="m-signature" rows="4" style="width:100%;background:var(--bg);border:1px solid var(--line);color:var(--text);padding:8px 10px;border-radius:7px;font-size:14px;font-family:var(--sans);">${escapeHtml(u.consEmailSignature||'')}</textarea>
-    ${isMainRoot(u) ? '' : `<label><input type="checkbox" id="m-isroot" ${u.isRoot?'checked':''} style="width:auto;display:inline-block;margin-right:6px"> Root user</label>`}
-    ${appAccessChecklistHtml('eu', apps, iAmMainRoot)}
-    <label style="margin-top:8px;">What can they do in this app?</label>
-    <div class="checklist">
-      <label><input type="checkbox" id="p-consHandOut" ${perms.consHandOut?'checked':''}> Hand out items</label>
-      <label><input type="checkbox" id="p-consManageConsumables" ${perms.consManageConsumables?'checked':''}> Update container fill levels</label>
-      <label><input type="checkbox" id="p-consManageItems" ${perms.consManageItems?'checked':''}> Add/edit items &amp; reorder levels</label>
-      <label><input type="checkbox" id="p-consViewReports" ${perms.consViewReports?'checked':''}> View reports</label>
-      <label><input type="checkbox" id="p-consExportExcel" ${perms.consExportExcel?'checked':''}> Export to Excel</label>
-      <label><input type="checkbox" id="p-consSendToDispatch" ${perms.consSendToDispatch?'checked':''}> Send to Dispatch</label>
+    <textarea id="m-signature" rows="4" style="width:100%;background:var(--bg);border:1px solid var(--line);color:var(--text);padding:8px 10px;border-radius:7px;font-size:14px;font-family:var(--sans);">${escapeHtml(u.signature||'')}</textarea>
+    <label><input type="checkbox" id="m-isroot" ${u.isRoot?'checked':''} style="width:auto;display:inline-block;margin-right:6px"> Root user</label>
+    <div class="checklist" style="margin-top:8px">
+      <label><input type="checkbox" id="p-handOut" ${perms.handOut?'checked':''}> Hand out items</label>
+      <label><input type="checkbox" id="p-manageConsumables" ${perms.manageConsumables?'checked':''}> Update container fill levels</label>
+      <label><input type="checkbox" id="p-manageItems" ${perms.manageItems?'checked':''}> Add/edit items &amp; reorder levels</label>
+      <label><input type="checkbox" id="p-viewReports" ${perms.viewReports?'checked':''}> View reports</label>
+      <label><input type="checkbox" id="p-exportExcel" ${perms.exportExcel?'checked':''}> Export to Excel</label>
     </div>
-    ${isMainRoot(u) ? '' : `<div class="btn-row"><button class="btn btn-danger" id="m-delete" type="button">Delete this user</button></div>`}
-  `, async ()=>{
-    if(isMainRoot(u) && !currentUserIsMainRoot()) return false; // belt and braces
+    <div class="btn-row"><button class="btn btn-danger" id="m-delete" type="button">Delete this user</button></div>
+  `, ()=>{
     const username = document.getElementById('m-username').value.trim();
-    const pin = document.getElementById('m-pin').value;
+    const pin = document.getElementById('m-pin').value.trim();
     const signature = document.getElementById('m-signature').value.trim();
-    const isRootBox = document.getElementById('m-isroot');
-    if(!username){ toast('Enter a username', 'err'); return false; }
+    const isRoot = document.getElementById('m-isroot').checked;
+    if(!username || !pin){ toast('Enter a username and PIN', 'err'); return false; }
     const newPerms = {
-      consHandOut: document.getElementById('p-consHandOut').checked,
-      consManageConsumables: document.getElementById('p-consManageConsumables').checked,
-      consManageItems: document.getElementById('p-consManageItems').checked,
-      consViewReports: document.getElementById('p-consViewReports').checked,
-      consExportExcel: document.getElementById('p-consExportExcel').checked,
-      consSendToDispatch: document.getElementById('p-consSendToDispatch').checked,
-      manageUsers: (u.permissions && u.permissions.manageUsers) || false
+      handOut: document.getElementById('p-handOut').checked,
+      manageConsumables: document.getElementById('p-manageConsumables').checked,
+      manageItems: document.getElementById('p-manageItems').checked,
+      viewReports: document.getElementById('p-viewReports').checked,
+      exportExcel: document.getElementById('p-exportExcel').checked,
+      manageUsers: false
     };
-    u.username = username;
-    if(pin) u.pin = await hashPin(pin);
-    u.consEmailSignature = signature;
-    // Merge, don't replace — replacing wiped this person's permissions in
-    // the other three apps (Dispatch, Stock List, Board Stock).
-    u.permissions = { ...(u.permissions || {}), ...newPerms };
-    u.isRoot = isMainRoot(u) ? true : (isRootBox ? isRootBox.checked : u.isRoot);
-    u.apps = isMainRoot(u) ? defaultApps() : readAppAccessChecklist('eu', iAmMainRoot, apps);
-    await saveSharedUsers();
+    dbRef('users/' + id).update({ username, pin, signature, isRoot, perms: newPerms });
     return true;
   });
   setTimeout(()=>{
     const del = document.getElementById('m-delete');
-    if(del) del.onclick = async ()=>{
-      if(id === State.currentUser.id){ toast("You can't delete the account you're logged in as", 'err'); return; }
-      if(u.isRoot && State.sharedUsers.filter(x=>x.isRoot).length <= 1){ toast("You can't delete the only root account — make another user root first", 'err'); return; }
-      if(confirm('Remove user ' + u.username + '? They will no longer be able to log in to any app.')){
-        State.sharedUsers = State.sharedUsers.filter(x=>x.id!==id);
-        await saveSharedUsers();
+    if(del) del.onclick = ()=>{
+      if(id === State.currentUser.id){ toast("You can't delete yourself while logged in", 'err'); return; }
+      if(confirm('Delete user ' + u.username + '?')){
+        dbRef('users/' + id).remove();
         closeModal();
       }
     };
@@ -2562,10 +1312,62 @@ function closeModal(){
 }
 
 /* =========================================================================
+   SETUP SCREEN (first run — root pastes Firebase config)
+   ========================================================================= */
+function renderSetupScreen(){
+  const app = document.getElementById('app');
+  app.innerHTML = '';
+  const wrap = el('div','setup-screen');
+  wrap.innerHTML = `
+    <h1 style="margin-top:40px">First-time setup</h1>
+    <div class="sub" style="margin-bottom:18px">Paste your Firebase project config below. See SETUP.md for how to create one. This is a one-time step per device/browser the first time this file is opened from a new host — after that it's saved.</div>
+    <label>Firebase config (paste the whole JS object from your Firebase console)</label>
+    <textarea id="fb-config" rows="8" style="width:100%;background:var(--bg);border:1px solid var(--line);color:var(--text);padding:10px;border-radius:7px;font-family:var(--mono);font-size:12.5px;" placeholder='{
+  "apiKey": "...",
+  "authDomain": "...",
+  "databaseURL": "...",
+  "projectId": "...",
+  "storageBucket": "...",
+  "messagingSenderId": "...",
+  "appId": "..."
+}'></textarea>
+    <div class="btn-row"><button class="btn btn-amber" id="fb-save">Save &amp; continue</button></div>
+    <div class="err" id="fb-err"></div>
+  `;
+  app.appendChild(wrap);
+  document.getElementById('fb-save').onclick = ()=>{
+    const raw = document.getElementById('fb-config').value.trim();
+    try{
+      const parsed = JSON.parse(raw);
+      CONFIG.FIREBASE_CONFIG = parsed;
+      saveConfig(CONFIG);
+      initFirebase();
+      seedRootUserIfNeeded();
+    }catch(e){
+      document.getElementById('fb-err').textContent = 'Could not parse that as JSON. Make sure it is valid JSON (keys in quotes).';
+    }
+  };
+}
+
+function seedRootUserIfNeeded(){
+  setTimeout(()=>{
+    if(!State.db) return;
+    dbRef('users').once('value').then(snap=>{
+      if(!snap.exists() || Object.keys(snap.val()||{}).length === 0){
+        const id = uid();
+        dbRef('users/' + id).set({
+          username: 'root', pin: '0000', isRoot: true,
+          perms: { manageUsers:true, manageItems:true, handOut:true, manageConsumables:true, viewReports:true, exportExcel:true }
+        }).then(()=> toast('Created default login: root / 0000 — change the PIN in Admin', 'ok'));
+      }
+    });
+  }, 1200);
+}
+
+/* =========================================================================
    BOOT
    ========================================================================= */
 if(CONFIG.EMAILJS_PUBLIC_KEY){ try{ emailjs.init(CONFIG.EMAILJS_PUBLIC_KEY); }catch(e){} }
-if ('serviceWorker' in navigator){ navigator.serviceWorker.register('sw.js').catch(()=>{}); }
 initFirebase();
 </script>
 </body>
