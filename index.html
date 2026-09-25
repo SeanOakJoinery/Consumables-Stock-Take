@@ -117,7 +117,9 @@
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-database-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-storage-compat.js"></script>
-<script src="https://seanoakjoinery.github.io/oak-core/oak-core.js?v=2"></script>
+<script src="https://seanoakjoinery.github.io/oak-core/oak-core.js?v=3"></script>
+<script>/* ONE LOGIN (oak-core v3): no session on this device -> log in on the Oak Joinery home app first. Add ?local=1 to the URL to use this app's own login screen instead. */
+(function(){try{var S=window.OakCore&&OakCore.session;if(S&&!S.get()&&!S.localLoginAllowed())S.goHome({next:'consumables'});}catch(e){}})();</script>
 <script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 
@@ -414,7 +416,7 @@ function onDataChange(){
 }
 
 /* =========================================================================
-   Oak Core cutover 2026-09-24: users sync/save + hashPin via https://seanoakjoinery.github.io/oak-core/oak-core.js?v=2 — rollback branch backup-before-oak-core-2026-09-24
+   Oak Core cutover 2026-09-24: users sync/save + hashPin via https://seanoakjoinery.github.io/oak-core/oak-core.js?v=3 — rollback branch backup-before-oak-core-2026-09-24
    SHARED AUTH — same users[]/permissions system as the Dispatch, Stock
    List, and Board Stock apps. Login/user-management via OakCore; this app's
    OWN data (screws, consumables, people, transactions, suppliers) stays
@@ -434,6 +436,21 @@ function userHasApp(u, appId){
   return !!u.apps[appId];
 }
 async function hashPin(pin){ return OakCore.hashPin(pin); }
+// ===================== ONE LOGIN (oak-core v3) =====================
+// The Oak Joinery home app (/oak-core/) is the one login screen. This app
+// picks up who's logged in on this device; "Menu" goes back home.
+function ssoOn(){ return !!(window.OakCore && OakCore.session); }
+function ssoGoMenu(){ if(ssoOn()) OakCore.session.goHome(); }
+// Returns the logged-in user, or null (and heads home) if there isn't one.
+function ssoResolve(list){
+  if(!ssoOn()) return null;
+  const r = OakCore.session.resolve(list, APP_ID);
+  if(r.status === 'ok') return r.user;
+  if(r.status === 'wait' || OakCore.session.localLoginAllowed()) return null;
+  OakCore.session.goHome(r.status === 'denied' ? { denied: APP_ID } : { next: APP_ID });
+  return null;
+}
+
 // Writes State.sharedUsers via OakCore (shared dispatchBoard/users path).
 async function saveSharedUsers(){
   if(!oak) return;
@@ -456,11 +473,14 @@ async function attemptLogin(username, pin){
   if(enteredHash !== u.pin) return 'Incorrect PIN.';
   State.currentUser = u;
   sessionStorage.setItem(SESSION_KEY, JSON.stringify({id: u.id}));
+  if(ssoOn()) OakCore.session.set(u);
   render();
   return null;
 }
 
 function tryRestoreSession(){
+  const su = ssoResolve(State.sharedUsers);
+  if(su){ State.currentUser = su; return; }
   try{
     const raw = sessionStorage.getItem(SESSION_KEY);
     if(!raw) return;
@@ -674,10 +694,10 @@ function renderTopbar(){
     <div class="who">
       <div class="brand-wordmark">OAK<span>JOINERY</span></div>
       <span>${State.currentUser.username}${isMainRoot(State.currentUser) ? ' · main root' : (State.currentUser.isRoot ? ' · root' : '')}</span>
-      <button id="logout-btn">Sign out</button>
+      <button id="logout-btn">☰ Menu</button>
     </div>
   `;
-  setTimeout(()=> document.getElementById('logout-btn').onclick = logout);
+  setTimeout(()=> document.getElementById('logout-btn').onclick = () => ssoOn() ? ssoGoMenu() : logout());
   return bar;
 }
 
