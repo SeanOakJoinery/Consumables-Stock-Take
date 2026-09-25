@@ -770,7 +770,15 @@ const SIZE_SUGGESTIONS = {
 };
 const EACH_SIZES = SIZE_SUGGESTIONS.each; // kept for older code paths
 const RUNNER_LENGTHS = ['250 mm', '270 mm', '300 mm', '350 mm', '400 mm', '450 mm', '500 mm', '550 mm', '600 mm'];
-const TIN_SIZES = ['250 ml', '500 ml', '1 L', '5 L', '20 L'];
+const TIN_SIZES = ['250 ml', '500 ml', '1 L', '5 L', '20 L', '25 L'];
+// Litres in one tin, from its size ("25 L", "500 ml"); 0 if unknown.
+function tinLitres(item){
+  const m = String((item && item.packSize) || '').replace(',', '.').match(/([\d.]+)\s*(ml|l)\b/i);
+  if(!m) return 0;
+  const v = parseFloat(m[1]); return /ml/i.test(m[2]) ? v / 1000 : v;
+}
+function roundQ(n){ return Math.round(n * 1000) / 1000; }
+function litresLabel(l){ return (Math.round(l * 100) / 100) + ' L'; }
 const ROLL_LEVELS = ['Full', '3/4', '1/2', '1/4'];
 const ROLL_FRACTION = { 'Full': 1, '3/4': 0.75, '1/2': 0.5, '1/4': 0.25 };
 const ROLL_SYMBOL = { 'Full': 'full', '3/4': '¾', '1/2': '½', '1/4': '¼' };
@@ -796,13 +804,15 @@ function stockAmount(item){
   return totalScrewQty(item) + (itemUnit(item) === 'roll' ? openRollTotal(item) : 0);
 }
 function stockAtLabel(item, location){
-  const n = screwQtyAt(item, location);
+  const n = roundQ(screwQtyAt(item, location));
+  if(itemUnit(item) === 'tin' && tinLitres(item)) return litresLabel(n * tinLitres(item));
   if(itemUnit(item) !== 'roll') return String(n);
   const open = openRollAt(item, location);
   return open ? `${n} + ${ROLL_SYMBOL[open]} open` : String(n);
 }
 function stockTotalLabel(item){
-  const n = totalScrewQty(item);
+  const n = roundQ(totalScrewQty(item));
+  if(itemUnit(item) === 'tin' && tinLitres(item)) return litresLabel(n * tinLitres(item));
   if(itemUnit(item) !== 'roll') return `${n}`;
   const opens = Object.values(item.openRollByLocation || {}).filter(Boolean);
   return opens.length ? `${n} + ${opens.map(l => ROLL_SYMBOL[l]).join(' + ')} open` : `${n}`;
@@ -827,7 +837,7 @@ function renderCountedCard(tabKey){
   const card = el('div', 'card');
   const header = el('div', '');
   header.innerHTML = onLiquidTab
-    ? `<h2>Tins (stains, lacquers etc.)</h2><div class="sub">Counted per tin — pick the tin size (250 ml, 500 ml, 1 L, 5 L or 20 L) for each item.</div>`
+    ? `<h2>Tins (stains, lacquers etc.)</h2><div class="sub">Counted per tin — pick the tin size (250 ml, 500 ml, 1 L, 5 L, 20 L or 25 L) for each item. Stock and hand-outs are in litres (e.g. hand out 5 L from a 25 L tin); restock in whole tins.</div>`
     : `<h2>Consumables</h2><div class="sub">Grouped by category. Screws and fittings in packs (per 500 etc.), hinges, plates and stopping tubs each, drawer runners in pairs, and rolls (edging, production rolls) as whole rolls plus the open roll (Full / ¾ / ½ / ¼).</div>`;
   card.appendChild(header);
 
@@ -859,7 +869,7 @@ function renderCountedCard(tabKey){
         <td>${escapeHtml(unitLabel(item))}</td>
         <td class="num">${escapeHtml(stockTotalLabel(item))}</td>
         <td class="sub" style="font-size:12px;">${breakdown}</td>
-        <td class="num">${item.reorderQty}</td>
+        <td class="num">${itemUnit(item) === 'tin' && tinLitres(item) ? litresLabel((item.reorderQty || 0) * tinLitres(item)) : item.reorderQty}</td>
         <td>${escapeHtml(supplierName)}</td>
         <td>${low ? '<span class="pill low">Reorder</span>' : '<span class="pill ok">OK</span>'}</td>
         <td></td>
@@ -992,7 +1002,7 @@ function unitFieldsHtml(item, lockedToTin){
     <div id="m-length-wrap"><label>Runner length</label>
       <select id="m-length">${RUNNER_LENGTHS.map(s => `<option value="${s}" ${s===lenVal?'selected':''}>${s}</option>`).join('')}${lenVal && !RUNNER_LENGTHS.includes(lenVal) ? `<option value="${escapeHtml(lenVal)}" selected>${escapeHtml(lenVal)}</option>` : ''}</select></div>
     <div id="m-tinsize-wrap"><label>Tin size</label>
-      <select id="m-tinsize">${TIN_SIZES.map(s => `<option value="${s}" ${s===tinVal?'selected':''}>${s}</option>`).join('')}</select></div>
+      <select id="m-tinsize">${TIN_SIZES.map(s => `<option value="${s}" ${s===tinVal?'selected':''}>${s}</option>`).join('')}${tinVal && !TIN_SIZES.includes(tinVal) ? `<option value="${escapeHtml(tinVal)}" selected>${escapeHtml(tinVal)}</option>` : ''}</select></div>
     ${catSelect}`;
 }
 function wireUnitFields(){
@@ -1006,7 +1016,7 @@ function wireUnitFields(){
     document.getElementById('m-length-wrap').style.display = u === 'pair' ? 'block' : 'none';
     document.getElementById('m-tinsize-wrap').style.display = u === 'tin' ? 'block' : 'none';
     document.getElementById('m-size-list').innerHTML = (SIZE_SUGGESTIONS[u] || []).map(v => `<option value="${escapeHtml(v)}">`).join('');
-    document.querySelectorAll('.m-unitword').forEach(e => e.textContent = ITEM_UNITS[u].word);
+    document.querySelectorAll('.m-unitword').forEach(e => e.textContent = u === 'tin' ? 'litres' : ITEM_UNITS[u].word);
     // Follow the unit's usual category unless someone already picked a different one.
     if(catSel && catSel.tagName === 'SELECT' && catSel.value === DEFAULT_CATEGORY[lastUnit]) catSel.value = DEFAULT_CATEGORY[u];
     lastUnit = u;
@@ -1042,8 +1052,9 @@ function openAddScrewModal(defaultUnit){
     const size = document.getElementById('m-size').value.trim();
     const photo = readPhotoField();
     const u = readUnitFields();
-    const reorderQty = parseInt(document.getElementById('m-reorder').value) || 0;
-    const qty = parseInt(document.getElementById('m-qty').value) || 0;
+    const addPerTin = u.unit === 'tin' ? tinLitres({ packSize: u.packSize }) : 0;   // tins are entered in litres
+    const reorderQty = addPerTin ? roundQ((parseFloat(document.getElementById('m-reorder').value) || 0) / addPerTin) : (parseInt(document.getElementById('m-reorder').value) || 0);
+    const qty = addPerTin ? roundQ((parseFloat(document.getElementById('m-qty').value) || 0) / addPerTin) : (parseInt(document.getElementById('m-qty').value) || 0);
     const location = document.getElementById('m-loc').value;
     const supplierId = document.getElementById('m-supplier').value || null;
     if(!size){ toast('Enter a name', 'err'); return false; }
@@ -1060,14 +1071,15 @@ function openAddScrewModal(defaultUnit){
 function openEditScrewModal(id){
   const item = State.screwItems[id];
   const editLocations = (State.locations && State.locations.length) ? State.locations : ['Main'];
+  const editPerTin = itemUnit(item) === 'tin' ? tinLitres(item) : 0;
   const isTin = itemUnit(item) === 'tin';
   openModal('Edit ' + itemName(item), `
     <label>Name</label>
     <input type="text" id="m-size" value="${escapeHtml(item.size)}">
     ${unitFieldsHtml(item, isTin)}
-    <label>Reorder at (<span class="m-unitword"></span>)</label><input type="number" id="m-reorder" value="${item.reorderQty}">
-    ${currentUserIsRoot() ? `<label>Stock on hand (<span class="m-unitword"></span>) — root only, logged as a stock correction</label>
-      <div class="row2">${editLocations.map((l,i)=>`<div><label style="margin-top:0;font-weight:400">${escapeHtml(l)}</label><input type="number" min="0" step="1" id="m-qty-${i}" value="${screwQtyAt(item, l)}"></div>`).join('')}</div>` : ''}
+    <label>Reorder at (<span class="m-unitword"></span>)</label><input type="number" id="m-reorder" step="any" value="${editPerTin ? roundQ((item.reorderQty || 0) * editPerTin) : item.reorderQty}">
+    ${currentUserIsRoot() ? `<label>Stock on hand (${editPerTin ? 'litres' : '<span class="m-unitword"></span>'}) — root only, logged as a stock correction</label>
+      <div class="row2">${editLocations.map((l,i)=>`<div><label style="margin-top:0;font-weight:400">${escapeHtml(l)}</label><input type="number" min="0" step="${editPerTin ? '0.25' : '1'}" id="m-qty-${i}" value="${editPerTin ? roundQ(screwQtyAt(item, l) * editPerTin) : roundQ(screwQtyAt(item, l))}"></div>`).join('')}</div>` : ''}
     ${supplierSelectHtml('m-supplier', item.supplierId)}
     ${photoFieldHtml(item.photoUrl)}
     <div class="btn-row"><button class="btn btn-danger" id="m-delete" type="button">Delete this item</button></div>
@@ -1075,7 +1087,8 @@ function openEditScrewModal(id){
     const size = document.getElementById('m-size').value.trim();
     const photo = readPhotoField();
     const u = readUnitFields();
-    const reorderQty = parseInt(document.getElementById('m-reorder').value) || 0;
+    const newPerTin = u.unit === 'tin' ? tinLitres({ packSize: u.packSize }) : 0;
+    const reorderQty = newPerTin ? roundQ((parseFloat(document.getElementById('m-reorder').value) || 0) / newPerTin) : (parseInt(document.getElementById('m-reorder').value) || 0);
     const supplierId = document.getElementById('m-supplier').value || null;
     if(!size){ toast('Enter a name', 'err'); return false; }
     const upd = { size, unit: u.unit, category: u.category, reorderQty, supplierId, bundleSize: u.bundleSize || null, packSize: u.packSize || null };
@@ -1088,9 +1101,12 @@ function openEditScrewModal(id){
       editLocations.forEach((l, i) => {
         const el = document.getElementById('m-qty-' + i);
         if(!el || el.value === '') return;
-        const n = Math.max(0, Math.round(Number(el.value) || 0));
+        const v = Math.max(0, Number(el.value) || 0);
+        const n = editPerTin ? roundQ(v / editPerTin) : (itemUnit(item) === 'tin' ? roundQ(v) : Math.round(v));
         const before = screwQtyAt(item, l);
-        if(n !== before){ q[l] = n; changes.push({ label: size + ' (' + l + ')', unit: unitWord({ ...item, ...upd }), before, after: n }); }
+        if(Math.abs(n - before) > 0.0005){ q[l] = n; changes.push(editPerTin
+          ? { label: size + ' (' + l + ')', unit: 'litres', before: roundQ(before * editPerTin), after: roundQ(v) }
+          : { label: size + ' (' + l + ')', unit: unitWord({ ...item, ...upd }), before, after: n }); }
       });
       if(changes.length){
         upd.qtyByLocation = q;
@@ -1170,8 +1186,9 @@ function openRestockModal(kind, id){
   const item = kind === 'screw' ? State.screwItems[id] : State.consumableTypes[id];
   const label = kind === 'screw' ? itemName(item) : item.name;
   const word = kind === 'screw' ? unitWord(item) : 'bundle(s)';
+  const rPerTin = kind === 'screw' && itemUnit(item) === 'tin' ? tinLitres(item) : 0;
   openModal('Restock ' + label, `
-    <label>Amount to add (${word})</label>
+    <label>Amount to add (${word}${rPerTin ? ' of ' + rPerTin + ' L' : ''})</label>
     <input type="number" id="m-add" value="1" min="1">
     ${kind === 'screw' ? locationSelectHtml('m-loc', null) : ''}
   `, ()=>{
@@ -1268,35 +1285,41 @@ function openHandOutModal(kind, id){
   const item = State.screwItems[id];
   const name = itemName(item);
   const word = unitWord(item);
+  // Tins with a known size (e.g. 25 L thinners) can be handed out in litres;
+  // stock stays counted in tins, so 5 L out of a 25 L tin leaves 0.8 of a tin.
+  const perTin = itemUnit(item) === 'tin' ? tinLitres(item) : 0;
+  const byLitre = perTin >= 1;
   openModal('Hand out ' + name, `
     ${item.photoUrl ? `<img src="${item.photoUrl}" alt="" style="max-width:100%;max-height:160px;border-radius:8px;margin-bottom:8px;">` : ''}
     ${allocationSelectHtml()}
     ${locationSelectHtml('m-loc', null)}
     <div class="row2">
-      <div><label>Qty (${word})</label><input type="number" id="m-qty" value="1" min="1"></div>
+      <div><label>Qty (${byLitre ? 'litres' : word})</label><input type="number" id="m-qty" value="${byLitre ? '0.75' : '1'}" min="0" step="${byLitre ? '0.25' : '1'}"></div>
       <div><label>Date</label><input type="date" id="m-date" value="${todayStr()}"></div>
     </div>
-    <div class="sub" style="margin-top:8px">Total on hand: ${escapeHtml(stockTotalLabel(item))} ${word}</div>
+    <div class="sub" style="margin-top:8px">Total on hand: ${escapeHtml(stockTotalLabel(item))}${byLitre ? '' : ' ' + word}</div>
   `, ()=>{
-    const qty = parseInt(document.getElementById('m-qty').value) || 0;
+    const raw = parseFloat(document.getElementById('m-qty').value) || 0;
+    const inLitres = byLitre;
+    const qty = inLitres ? roundQ(raw / perTin) : Math.round(raw);
     const date = document.getElementById('m-date').value || todayStr();
     const location = document.getElementById('m-loc').value;
     if(qty <= 0){ toast('Enter a positive qty', 'err'); return false; }
     const here = screwQtyAt(item, location);
-    if(qty > here){ if(!confirm('That is more than the ' + here + ' ' + word + ' on hand at ' + location + '. Continue anyway?')) return false; }
+    if(qty > here + 0.0005){ if(!confirm('That is more than the ' + stockAtLabel(item, location) + (byLitre ? '' : ' ' + word) + ' on hand at ' + location + '. Continue anyway?')) return false; }
     const alloc = resolveAllocation();
     if(!alloc) return false;
 
     const finishPersonId = (personId)=>{
       if(!item.qtyByLocation) item.qtyByLocation = {};
-      item.qtyByLocation[location] = here - qty;
+      item.qtyByLocation[location] = roundQ(here - qty);
       dbRef('screwItems/' + id + '/qtyByLocation').set(item.qtyByLocation);
       checkReorder('screw', id, name, stockAmount(item), item.reorderQty, item.reorderSent, item.supplierId);
       dbRef('transactions/' + uid()).set({
-        personId, itemType:'screw', itemId:id, itemLabel: name, unit: itemUnit(item), category: itemCategory(item), qty, date, month: monthKey(date),
+        personId, itemType:'screw', itemId:id, itemLabel: name, unit: inLitres ? 'litres' : itemUnit(item), category: itemCategory(item), qty: inLitres ? raw : qty, date, month: monthKey(date),
         recipientType: alloc.recipientType, recipientName: alloc.recipientName, handedOutBy: currentUsername(), location
       });
-      toast('Handed out ' + qty + ' ' + word + ' of ' + name + ' → ' + alloc.recipientName, 'ok');
+      toast('Handed out ' + (inLitres ? raw + ' L' : qty + ' ' + word) + ' of ' + name + ' → ' + alloc.recipientName, 'ok');
     };
     finishPersonId(alloc.personId);
     return true;
@@ -1323,8 +1346,9 @@ function countLoc(){
 function countRows(loc){
   const rows = [];
   Object.entries(State.screwItems || {}).forEach(([id, item]) => {
-    rows.push({ key: 's:' + id, kind: 'item', id, item, label: itemName(item), unit: unitWord(item), cat: itemCategory(item),
-      sys: screwQtyAt(item, loc), isRoll: itemUnit(item) === 'roll', sysOpen: openRollAt(item, loc) || '' });
+    const perTin = itemUnit(item) === 'tin' ? tinLitres(item) : 0;   // sized tins are counted in litres
+    rows.push({ key: 's:' + id, kind: 'item', id, item, label: itemName(item), unit: perTin ? 'litres' : unitWord(item), cat: itemCategory(item), perTin,
+      sys: perTin ? roundQ(screwQtyAt(item, loc) * perTin) : screwQtyAt(item, loc), isRoll: itemUnit(item) === 'roll', sysOpen: openRollAt(item, loc) || '' });
   });
   Object.entries(State.consumableTypes || {}).filter(([tid, t]) => t.category === 'liquid').forEach(([tid, t]) => {
     rows.push({ key: 'l:' + tid, kind: 'liquid', id: tid, item: t, label: t.name, unit: 'litres', cat: 'Liquids (by volume)',
@@ -1432,10 +1456,10 @@ async function applyConsCount(){
     if(row.kind === 'item'){
       const item = State.screwItems[row.id];
       if(d.n !== undefined && d.n !== row.sys){
-        const q = { ...(item.qtyByLocation || {}) }; q[loc] = Math.round(d.n);
+        const q = { ...(item.qtyByLocation || {}) }; q[loc] = row.perTin ? roundQ(d.n / row.perTin) : Math.round(d.n);
         await dbRef('screwItems/' + row.id + '/qtyByLocation').set(q);
         item.qtyByLocation = q;
-        changes.push({ label: row.label, unit: row.unit, before: row.sys, after: Math.round(d.n) });
+        changes.push({ label: row.label, unit: row.unit, before: row.sys, after: row.perTin ? roundQ(d.n) : Math.round(d.n) });
       }
       if(row.isRoll && d.open !== undefined && d.open !== row.sysOpen){
         const o = { ...(item.openRollByLocation || {}) };
@@ -1879,7 +1903,7 @@ function renderPeopleTab(){
         const tbody = document.createElement('tbody');
         list.sort((a,b)=> a.date.localeCompare(b.date)).forEach(t=>{
           const tr = document.createElement('tr');
-          tr.innerHTML = `<td>${t.date}</td><td>${escapeHtml(t.itemLabel)}</td><td class="num">${t.qty}</td><td>${escapeHtml(t.handedOutBy || '—')}</td>`;
+          tr.innerHTML = `<td>${t.date}</td><td>${escapeHtml(t.itemLabel)}</td><td class="num">${t.qty}${t.unit === 'litres' ? ' L' : ''}</td><td>${escapeHtml(t.handedOutBy || '—')}</td>`;
           tbody.appendChild(tr);
         });
         table.appendChild(tbody);
@@ -2091,7 +2115,7 @@ function exportToExcel(personSel, monthSel){
     Item: t.itemLabel,
     Type: t.itemType === 'screw' ? (t.category || (State.screwItems[t.itemId] ? itemCategory(State.screwItems[t.itemId]) : 'Consumables')) : 'Liquid',
     Qty: t.qty,
-    Unit: t.itemType === 'screw' ? (ITEM_UNITS[t.unit] ? ITEM_UNITS[t.unit].word : 'bundle(s)') : 'ml'
+    Unit: t.unit === 'litres' ? 'litres' : (t.itemType === 'screw' ? (ITEM_UNITS[t.unit] ? ITEM_UNITS[t.unit].word : 'bundle(s)') : 'ml')
   }));
 
   if(rows.length === 0){ toast('Nothing to export for that selection', 'err'); return; }
