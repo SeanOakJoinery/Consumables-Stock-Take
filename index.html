@@ -803,8 +803,32 @@ function openRollTotal(item){
 function stockAmount(item){
   return totalScrewQty(item) + (itemUnit(item) === 'roll' ? openRollTotal(item) : 0);
 }
+// Packs can be handed out as single items: stock stays in packs, so 20 screws
+// out of a pack of 500 leaves 0.96 of a pack, shown as "0 + 480 ea".
+function packCount(item){ return itemUnit(item) === 'per500' ? (parseInt(item.bundleSize) || 500) : 0; }
+function roundP(n){ return Math.round(n * 1e6) / 1e6; }
+function packSplit(n, size){
+  let whole = Math.floor(n + 1e-6), rem = Math.round((n - whole) * size);
+  if(rem >= size){ whole++; rem = 0; }
+  return { whole, rem };
+}
+function packLabel(n, size){
+  if(n < 0 || Number.isInteger(roundQ(n))) return String(roundQ(n));
+  const p = packSplit(n, size);
+  return p.whole ? p.whole + ' + ' + p.rem + ' ea' : p.rem + ' ea';
+}
+// Full wording with the unit, e.g. "2 pack(s) + 150 ea", "5 L", "3 pair(s)".
+function qtyText(item, n){
+  const size = packCount(item);
+  if(size && n >= 0 && !Number.isInteger(roundQ(n))){ const p = packSplit(n, size); return (p.whole ? p.whole + ' pack(s) + ' : '') + p.rem + ' ea'; }
+  if(itemUnit(item) === 'tin' && tinLitres(item)) return litresLabel(roundQ(n) * tinLitres(item));
+  return roundQ(n) + ' ' + unitWord(item);
+}
+function stockTotalText(item){ return itemUnit(item) === 'roll' ? stockTotalLabel(item) + ' ' + unitWord(item) : qtyText(item, totalScrewQty(item)); }
+function stockAtText(item, loc){ return itemUnit(item) === 'roll' ? stockAtLabel(item, loc) + ' ' + unitWord(item) : qtyText(item, screwQtyAt(item, loc)); }
 function stockAtLabel(item, location){
   const n = roundQ(screwQtyAt(item, location));
+  if(packCount(item)) return packLabel(screwQtyAt(item, location), packCount(item));
   if(itemUnit(item) === 'tin' && tinLitres(item)) return litresLabel(n * tinLitres(item));
   if(itemUnit(item) !== 'roll') return String(n);
   const open = openRollAt(item, location);
@@ -812,6 +836,7 @@ function stockAtLabel(item, location){
 }
 function stockTotalLabel(item){
   const n = roundQ(totalScrewQty(item));
+  if(packCount(item)) return packLabel(totalScrewQty(item), packCount(item));
   if(itemUnit(item) === 'tin' && tinLitres(item)) return litresLabel(n * tinLitres(item));
   if(itemUnit(item) !== 'roll') return `${n}`;
   const opens = Object.values(item.openRollByLocation || {}).filter(Boolean);
@@ -1079,7 +1104,7 @@ function openEditScrewModal(id){
     ${unitFieldsHtml(item, isTin)}
     <label>Reorder at (<span class="m-unitword"></span>)</label><input type="number" id="m-reorder" step="any" value="${editPerTin ? roundQ((item.reorderQty || 0) * editPerTin) : item.reorderQty}">
     ${currentUserIsRoot() ? `<label>Stock on hand (${editPerTin ? 'litres' : '<span class="m-unitword"></span>'}) — root only, logged as a stock correction</label>
-      <div class="row2">${editLocations.map((l,i)=>`<div><label style="margin-top:0;font-weight:400">${escapeHtml(l)}</label><input type="number" min="0" step="${editPerTin ? '0.25' : '1'}" id="m-qty-${i}" value="${editPerTin ? roundQ(screwQtyAt(item, l) * editPerTin) : roundQ(screwQtyAt(item, l))}"></div>`).join('')}</div>` : ''}
+      <div class="row2">${editLocations.map((l,i)=>`<div><label style="margin-top:0;font-weight:400">${escapeHtml(l)}</label><input type="number" min="0" step="${editPerTin ? '0.25' : packCount(item) ? 'any' : '1'}" id="m-qty-${i}" value="${editPerTin ? roundQ(screwQtyAt(item, l) * editPerTin) : roundQ(screwQtyAt(item, l))}"></div>`).join('')}</div>` : ''}
     ${supplierSelectHtml('m-supplier', item.supplierId)}
     ${photoFieldHtml(item.photoUrl)}
     <div class="btn-row"><button class="btn btn-danger" id="m-delete" type="button">Delete this item</button></div>
@@ -1102,6 +1127,8 @@ function openEditScrewModal(id){
         const el = document.getElementById('m-qty-' + i);
         if(!el || el.value === '') return;
         const v = Math.max(0, Number(el.value) || 0);
+        // untouched boxes (e.g. 0.96 of a pack after single items were handed out) stay as they are
+        if(!editPerTin && Math.abs(v - roundQ(screwQtyAt(item, l))) < 0.0005) return;
         const n = editPerTin ? roundQ(v / editPerTin) : (itemUnit(item) === 'tin' ? roundQ(v) : Math.round(v));
         const before = screwQtyAt(item, l);
         if(Math.abs(n - before) > 0.0005){ q[l] = n; changes.push(editPerTin
@@ -1289,39 +1316,44 @@ function openHandOutModal(kind, id){
   // stock stays counted in tins, so 5 L out of a 25 L tin leaves 0.8 of a tin.
   const perTin = itemUnit(item) === 'tin' ? tinLitres(item) : 0;
   const byLitre = perTin > 0;   // any tin with a size is handed out by volume (L or ml)
+  const perPack = packCount(item); // packs can be handed out as whole packs or single items
   openModal('Hand out ' + name, `
     ${item.photoUrl ? `<img src="${item.photoUrl}" alt="" style="max-width:100%;max-height:160px;border-radius:8px;margin-bottom:8px;">` : ''}
     ${allocationSelectHtml()}
     ${locationSelectHtml('m-loc', null)}
     <div class="row2">
       <div><label>Qty</label><div style="display:flex;gap:6px"><input type="number" id="m-qty" value="${byLitre ? (perTin >= 1 ? '1' : '250') : '1'}" min="0" step="any" style="flex:1">
-        ${byLitre ? `<select id="m-qunit" style="width:auto"><option value="l" ${perTin >= 1 ? 'selected' : ''}>L</option><option value="ml" ${perTin < 1 ? 'selected' : ''}>ml</option></select>` : `<span style="align-self:center">${word}</span>`}</div></div>
+        ${byLitre ? `<select id="m-qunit" style="width:auto"><option value="l" ${perTin >= 1 ? 'selected' : ''}>L</option><option value="ml" ${perTin < 1 ? 'selected' : ''}>ml</option></select>`
+          : perPack ? `<select id="m-qunit" style="width:auto"><option value="pack">pack(s) of ${perPack}</option><option value="ea">each (single)</option></select>`
+          : `<span style="align-self:center">${word}</span>`}</div></div>
       <div><label>Date</label><input type="date" id="m-date" value="${todayStr()}"></div>
     </div>
-    <div class="sub" style="margin-top:8px">Total on hand: ${escapeHtml(stockTotalLabel(item))}${byLitre ? '' : ' ' + word}</div>
+    <div class="sub" style="margin-top:8px">Total on hand: ${escapeHtml(stockTotalText(item))}</div>
   `, ()=>{
     const raw = parseFloat(document.getElementById('m-qty').value) || 0;
     const inLitres = byLitre;
     const litres = byLitre ? (document.getElementById('m-qunit').value === 'ml' ? raw / 1000 : raw) : 0;
-    const qty = inLitres ? roundQ(litres / perTin) : Math.round(raw);
+    const byEach = perPack && document.getElementById('m-qunit').value === 'ea';
+    const eaQty = byEach ? Math.round(raw) : 0;
+    const qty = inLitres ? roundQ(litres / perTin) : byEach ? roundP(eaQty / perPack) : Math.round(raw);
     const date = document.getElementById('m-date').value || todayStr();
     const location = document.getElementById('m-loc').value;
     if(qty <= 0){ toast('Enter a positive qty', 'err'); return false; }
     const here = screwQtyAt(item, location);
-    if(qty > here + 0.0005){ if(!confirm('That is more than the ' + stockAtLabel(item, location) + (byLitre ? '' : ' ' + word) + ' on hand at ' + location + '. Continue anyway?')) return false; }
+    if(qty > here + 0.0005){ if(!confirm('That is more than the ' + stockAtText(item, location) + ' on hand at ' + location + '. Continue anyway?')) return false; }
     const alloc = resolveAllocation();
     if(!alloc) return false;
 
     const finishPersonId = (personId)=>{
       if(!item.qtyByLocation) item.qtyByLocation = {};
-      item.qtyByLocation[location] = roundQ(here - qty);
+      item.qtyByLocation[location] = perPack ? roundP(here - qty) : roundQ(here - qty);
       dbRef('screwItems/' + id + '/qtyByLocation').set(item.qtyByLocation);
       checkReorder('screw', id, name, stockAmount(item), item.reorderQty, item.reorderSent, item.supplierId);
       dbRef('transactions/' + uid()).set({
-        personId, itemType:'screw', itemId:id, itemLabel: name, unit: inLitres ? 'litres' : itemUnit(item), category: itemCategory(item), qty: inLitres ? roundQ(litres) : qty, date, month: monthKey(date),
+        personId, itemType:'screw', itemId:id, itemLabel: name, unit: inLitres ? 'litres' : byEach ? 'each' : itemUnit(item), category: itemCategory(item), qty: inLitres ? roundQ(litres) : byEach ? eaQty : qty, ...(byEach ? { byEach: true } : {}), date, month: monthKey(date),
         recipientType: alloc.recipientType, recipientName: alloc.recipientName, handedOutBy: currentUsername(), location
       });
-      toast('Handed out ' + (inLitres ? litresLabel(litres) : qty + ' ' + word) + ' of ' + name + ' → ' + alloc.recipientName, 'ok');
+      toast('Handed out ' + (inLitres ? litresLabel(litres) : byEach ? eaQty + ' ea' : qty + ' ' + word) + ' of ' + name + ' → ' + alloc.recipientName, 'ok');
     };
     finishPersonId(alloc.personId);
     return true;
@@ -1394,7 +1426,7 @@ function renderCountTab(){
     }
     const d = draft[row.key] || {};
     const tr = document.createElement('tr');
-    const sysText = `${row.sys} ${row.unit}` + (row.isRoll ? (row.sysOpen ? ` + ${ROLL_SYMBOL[row.sysOpen]} open` : ', no open roll') : '');
+    const sysText = (row.kind === 'item' && packCount(row.item) ? qtyText(row.item, row.sys) : `${row.sys} ${row.unit}`) + (row.isRoll ? (row.sysOpen ? ` + ${ROLL_SYMBOL[row.sysOpen]} open` : ', no open roll') : '');
     tr.innerHTML = `<td>${escapeHtml(row.label)}</td><td class="sub">${escapeHtml(sysText)}</td>
       <td><input type="number" min="0" step="${row.kind === 'liquid' ? '0.1' : '1'}" style="width:90px" value="${d.n !== undefined ? d.n : ''}" data-k="${row.key}">
         ${row.isRoll ? `<select data-open="${row.key}" style="width:auto;margin-top:4px;"><option value="__same" ${d.open === undefined ? 'selected' : ''}>open roll: as is</option><option value="" ${d.open === '' ? 'selected' : ''}>no open roll</option>${ROLL_LEVELS.map(l => `<option value="${l}" ${d.open === l ? 'selected' : ''}>open roll ${ROLL_SYMBOL[l]}</option>`).join('')}</select>` : ''}</td>
@@ -1905,7 +1937,7 @@ function renderPeopleTab(){
         const tbody = document.createElement('tbody');
         list.sort((a,b)=> a.date.localeCompare(b.date)).forEach(t=>{
           const tr = document.createElement('tr');
-          tr.innerHTML = `<td>${t.date}</td><td>${escapeHtml(t.itemLabel)}</td><td class="num">${t.qty}${t.unit === 'litres' ? ' L' : ''}</td><td>${escapeHtml(t.handedOutBy || '—')}</td>`;
+          tr.innerHTML = `<td>${t.date}</td><td>${escapeHtml(t.itemLabel)}</td><td class="num">${t.qty}${t.unit === 'litres' ? ' L' : t.byEach ? ' ea' : ''}</td><td>${escapeHtml(t.handedOutBy || '—')}</td>`;
           tbody.appendChild(tr);
         });
         table.appendChild(tbody);
@@ -2005,7 +2037,7 @@ function renderReportsTab(){
   } else {
     const ul = document.createElement('ul');
     ul.style.margin = '0'; ul.style.paddingLeft = '18px'; ul.style.fontSize='13.5px';
-    lowScrews.forEach(i=>{ const li=document.createElement('li'); li.textContent = `${itemName(i)} — ${stockTotalLabel(i)} ${unitWord(i)} left`; ul.appendChild(li); });
+    lowScrews.forEach(i=>{ const li=document.createElement('li'); li.textContent = `${itemName(i)} — ${stockTotalText(i)} left`; ul.appendChild(li); });
     lowConsList.forEach(([tid,t])=>{
       const li=document.createElement('li');
       li.textContent = t.category === 'liquid'
@@ -2117,7 +2149,7 @@ function exportToExcel(personSel, monthSel){
     Item: t.itemLabel,
     Type: t.itemType === 'screw' ? (t.category || (State.screwItems[t.itemId] ? itemCategory(State.screwItems[t.itemId]) : 'Consumables')) : 'Liquid',
     Qty: t.qty,
-    Unit: t.unit === 'litres' ? 'litres' : (t.itemType === 'screw' ? (ITEM_UNITS[t.unit] ? ITEM_UNITS[t.unit].word : 'bundle(s)') : 'ml')
+    Unit: t.unit === 'litres' ? 'litres' : t.byEach ? 'each' : (t.itemType === 'screw' ? (ITEM_UNITS[t.unit] ? ITEM_UNITS[t.unit].word : 'bundle(s)') : 'ml')
   }));
 
   if(rows.length === 0){ toast('Nothing to export for that selection', 'err'); return; }
@@ -2172,7 +2204,7 @@ function renderSendToDispatchTab(){
     const kind = document.getElementById('sd-kind').value;
     const itemWrap = document.getElementById('sd-item-wrap');
     if(kind === 'screw'){
-      itemWrap.innerHTML = `<label>Item</label><select id="sd-item">${screws.map(([id,s])=>`<option value="${id}">${escapeHtml(itemName(s))} (on hand: ${escapeHtml(stockTotalLabel(s))} ${unitWord(s)})</option>`).join('') || '<option value="">No items yet</option>'}</select>`;
+      itemWrap.innerHTML = `<label>Item</label><select id="sd-item">${screws.map(([id,s])=>`<option value="${id}">${escapeHtml(itemName(s))} (on hand: ${escapeHtml(stockTotalText(s))})</option>`).join('') || '<option value="">No items yet</option>'}</select>`;
       const setQtyLabel = ()=>{ const it = State.screwItems[document.getElementById('sd-item').value]; document.getElementById('sd-qty-label').textContent = 'Quantity (' + (it ? unitWord(it) : 'bundles') + ')'; };
       document.getElementById('sd-item').onchange = setQtyLabel;
       setQtyLabel();
