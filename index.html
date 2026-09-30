@@ -2335,13 +2335,13 @@ function renderSuppliersTab(){
   const suppliers = Object.entries(State.suppliers || {}).sort((a,b)=> a[1].name.localeCompare(b[1].name));
 
   const card = el('div','card');
-  card.innerHTML = `<h2>Suppliers</h2><div class="sub">Assign a supplier to each screw size and consumable type so reorder emails get bundled and sent to the right supplier automatically.</div>`;
+  card.innerHTML = `<h2>Suppliers</h2><div class="sub">Assign a supplier to each screw size and consumable type so reorder emails get bundled and sent to the right supplier automatically. Suppliers are added and edited in the <b>Suppliers</b> app — changes show up here straight away.</div>`;
 
   if(suppliers.length === 0){
-    card.appendChild(elHtml('div','empty','No suppliers added yet.'));
+    card.appendChild(elHtml('div','empty','No suppliers yet — add them in the Suppliers app and tick “Consumables”.'));
   } else {
     const table = document.createElement('table');
-    table.innerHTML = `<thead><tr><th>Supplier</th><th>Contact</th><th>Email</th><th>CC</th><th>Items assigned</th><th></th></tr></thead>`;
+    table.innerHTML = `<thead><tr><th>Supplier</th><th>Contact</th><th>Phone</th><th>Email</th><th>CC</th><th>Items assigned</th><th></th></tr></thead>`;
     const tbody = document.createElement('tbody');
     suppliers.forEach(([sid, s])=>{
       const screwCount = Object.values(State.screwItems||{}).filter(i=> i.supplierId===sid).length;
@@ -2352,6 +2352,7 @@ function renderSuppliersTab(){
       tr.innerHTML = `
         <td>${escapeHtml(s.name)}</td>
         <td>${escapeHtml(s.contactPerson||'—')}</td>
+        <td>${[s.tel, s.cell].filter(Boolean).map(n=> '<a href="tel:' + escapeHtml(String(n).replace(/[^\d+]/g,'')) + '">' + escapeHtml(n) + '</a>').join('<br>') || '—'}</td>
         <td>${escapeHtml(s.email||'—')}</td>
         <td>${escapeHtml(s.ccEmail||'—')}</td>
         <td class="num">${screwCount + consCount}${lowCount>0 ? ' <span class="pill low">'+lowCount+' need reorder</span>' : ''}</td>
@@ -2359,10 +2360,7 @@ function renderSuppliersTab(){
       `;
       const actionsTd = tr.lastElementChild;
       if(can('consManageItems')){
-        actionsTd.appendChild(smallBtn('Edit', ()=> openEditSupplierModal(sid)));
-        const sendBtn = smallBtn('Send reorder email now', ()=> sendReorderEmailNowForSupplier(sid));
-        sendBtn.style.marginLeft = '6px';
-        actionsTd.appendChild(sendBtn);
+        actionsTd.appendChild(smallBtn('Send reorder email now', ()=> sendReorderEmailNowForSupplier(sid)));
       }
       tbody.appendChild(tr);
     });
@@ -2370,12 +2368,13 @@ function renderSuppliersTab(){
     card.appendChild(table);
   }
 
-  if(can('consManageItems')){
+  {
     const row = el('div','btn-row');
-    const addBtn = document.createElement('button');
+    const addBtn = document.createElement('a');
     addBtn.className = 'btn btn-amber';
-    addBtn.textContent = '+ Add supplier';
-    addBtn.onclick = openAddSupplierModal;
+    addBtn.textContent = '🚚 Open the Suppliers app';
+    addBtn.href = 'https://seanoakjoinery.github.io/oak-core/suppliers/';
+    addBtn.style.textDecoration = 'none';
     row.appendChild(addBtn);
     card.appendChild(row);
   }
@@ -2384,66 +2383,7 @@ function renderSuppliersTab(){
   return container;
 }
 
-function openAddSupplierModal(){
-  openModal('Add supplier', `
-    <label>Supplier name</label>
-    <input type="text" id="m-name">
-    <label>Contact person</label>
-    <input type="text" id="m-contact">
-    <label>Reorder email address</label>
-    <input type="text" id="m-email">
-    <label>CC email (optional)</label>
-    <input type="text" id="m-cc">
-    <label style="display:flex;align-items:center;gap:7px;font-weight:400;margin-top:10px;"><input type="checkbox" id="m-direct" style="width:auto;"> Send the weekly digest straight to this supplier (skip reviewing it yourself first)</label>
-  `, ()=>{
-    const name = document.getElementById('m-name').value.trim();
-    const contactPerson = document.getElementById('m-contact').value.trim();
-    const email = document.getElementById('m-email').value.trim();
-    const ccEmail = document.getElementById('m-cc').value.trim();
-    const sendDirect = document.getElementById('m-direct').checked;
-    if(!name){ toast('Enter a supplier name', 'err'); return false; }
-    dbRef('suppliers/' + uid()).set({ name, contactPerson, email, ccEmail, sendDirect });
-    return true;
-  });
-}
-
-function openEditSupplierModal(sid){
-  const s = State.suppliers[sid];
-  openModal('Edit ' + s.name, `
-    <label>Supplier name</label>
-    <input type="text" id="m-name" value="${escapeHtml(s.name)}">
-    <label>Contact person</label>
-    <input type="text" id="m-contact" value="${escapeHtml(s.contactPerson||'')}">
-    <label>Reorder email address</label>
-    <input type="text" id="m-email" value="${escapeHtml(s.email||'')}">
-    <label>CC email (optional)</label>
-    <input type="text" id="m-cc" value="${escapeHtml(s.ccEmail||'')}">
-    <label style="display:flex;align-items:center;gap:7px;font-weight:400;margin-top:10px;"><input type="checkbox" id="m-direct" style="width:auto;" ${s.sendDirect?'checked':''}> Send the weekly digest straight to this supplier (skip reviewing it yourself first)</label>
-    <div class="btn-row"><button class="btn btn-danger" id="m-delete" type="button">Delete this supplier</button></div>
-  `, ()=>{
-    const name = document.getElementById('m-name').value.trim();
-    const contactPerson = document.getElementById('m-contact').value.trim();
-    const email = document.getElementById('m-email').value.trim();
-    const ccEmail = document.getElementById('m-cc').value.trim();
-    const sendDirect = document.getElementById('m-direct').checked;
-    if(!name){ toast('Enter a supplier name', 'err'); return false; }
-    dbRef('suppliers/' + sid).update({ name, contactPerson, email, ccEmail, sendDirect });
-    return true;
-  });
-  setTimeout(()=>{
-    const del = document.getElementById('m-delete');
-    if(del) del.onclick = ()=>{
-      if(confirm('Delete supplier ' + s.name + '? Items assigned to them will be unassigned, not deleted.')){
-        dbRef('suppliers/' + sid).remove();
-        Object.entries(State.screwItems||{}).filter(([k,i])=>i.supplierId===sid).forEach(([k])=> dbRef('screwItems/'+k+'/supplierId').set(null));
-        Object.entries(State.consumableTypes||{}).filter(([k,t])=>t.supplierId===sid).forEach(([k])=> dbRef('consumableTypes/'+k+'/supplierId').set(null));
-        closeModal();
-      }
-    };
-  });
-}
-
-/* ---------- Admin Tab ---------- */
+// Adding / editing suppliers moved to the Suppliers app (2026-09-30).
 function renderAdminTab(){
   const container = el('div','');
   const users = [...State.sharedUsers].sort((a,b)=> a.username.localeCompare(b.username));
