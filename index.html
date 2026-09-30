@@ -713,7 +713,7 @@ function renderTabs(){
   if(can('consViewReports') || can('consExportExcel')) items.splice(3, 0, ['reports','Reports & Export']);
   if(can('consManageItems')) items.push(['count','Stock Count']);
   if(can('consSendToDispatch')) items.push(['dispatch','Send to Dispatch']);
-  if(State.currentUser.isRoot || can('manageUsers')) items.push(['admin','Admin']);
+  if(State.currentUser.isRoot) items.push(['admin','Locations']); // users are managed only in the separate Users app
   items.forEach(([key,label])=>{
     const b = document.createElement('button');
     b.className = 'tab-btn' + (State.activeTab===key ? ' active':'');
@@ -2468,7 +2468,7 @@ function renderAdminTab(){
   table.appendChild(tbody);
   card.appendChild(table);
 
-  if(can('manageUsers')){
+  if(false){ // 2026-09-30: users are managed only in the separate Users app
     const row = el('div','btn-row');
     const addBtn = document.createElement('button');
     addBtn.className = 'btn btn-amber';
@@ -2477,7 +2477,7 @@ function renderAdminTab(){
     row.appendChild(addBtn);
     card.appendChild(row);
   }
-  container.appendChild(card);
+  // 2026-09-30: the Users list is gone from here — people and app access are managed in the Users app.
 
   if(State.currentUser.isRoot){
     const locCard = el('div','card');
