@@ -1258,6 +1258,7 @@ function allocationSelectHtml(){
         <option value="site">🚚 Sent to site…</option>
         <option value="headoffice">🏢 Head office</option>
       </optgroup>
+      ${((State.locations || []).length > 1) ? `<optgroup label="Move to another branch (goes to Dispatch → Ready to dispatch)">${State.locations.map(l => `<option value="transfer:${escapeHtml(l)}">🔁 Transfer to ${escapeHtml(l)}</option>`).join('')}</optgroup>` : ''}
       <option value="__new">+ New person…</option>
     </select>
     <div id="m-newname-wrap" style="display:none"><label>New person's name</label><input type="text" id="m-newname"></div>
@@ -1284,6 +1285,13 @@ function resolveAllocation(){
     const pid = v.slice(7);
     return { personId: pid, recipientType: 'person', recipientName: (State.people[pid] || {}).name || '' };
   }
+  if(v.startsWith('transfer:')){
+    const to = v.slice(9);
+    const from = (document.getElementById('m-loc') || {}).value;
+    if(to === from){ toast('That item is already at ' + to + ' — pick where it is coming FROM under Location.', 'err'); return null; }
+    if(!State.dispatchBoardRef){ toast('Not connected to the Dispatch app yet — try again in a moment.', 'err'); return null; }
+    return { transferTo: to, personId: null, recipientType: 'transfer', recipientName: 'Transfer → ' + to };
+  }
   if(v.startsWith('user:')){ name = v.slice(5); type = 'user'; }
   else if(v === 'site'){
     const site = document.getElementById('m-site').value.trim();
@@ -1305,6 +1313,26 @@ function resolveAllocation(){
   if(!State.people) State.people = {};
   State.people[pid] = rec;
   return { personId: pid, recipientType: type, recipientName: name };
+}
+/* 2026-09-28: branch transfers, per user request ("if i hand out items from
+   Boksburg to Kramerville or vice-versa it has to send the items to dispatch
+   app and that can go straight to ready to dispatch"). Choosing "Transfer to
+   <branch>" in Hand out moves the stock between locations straight away and
+   adds a line to the Dispatch app's Ready to dispatch column, with the
+   from → to branches as its reference. Logged under consumablesStock/transfers. */
+async function sendTransferToDispatch(label, qtyText, qty, from, to, unitText){
+  const today = new Date().toLocaleDateString('en-GB', {day:'2-digit', month:'long', year:'numeric'});
+  const newItem = {
+    id: uid(), type: label + ' (' + unitText + ')', qty, ref: 'Transfer ' + from + ' → ' + to,
+    status: 'ready', addedDate: today, vinagedDate: today, readyDate: today, dispatchedDate: null, noteId: null,
+    transfer: { from, to, sourceApp: 'consumablesStock' }
+  };
+  await State.dispatchBoardRef.child('items').transaction(current => {
+    const items = Array.isArray(current) ? current : (current && typeof current === 'object' ? Object.values(current) : []);
+    items.push(newItem);
+    return items;
+  });
+  dbRef('transfers/' + uid()).set({ ts: new Date().toISOString(), item: label, qty: qtyText, from, to, by: currentUsername() });
 }
 function currentUsername(){ return (State.currentUser && State.currentUser.username) || 'Unknown'; }
 
@@ -1344,6 +1372,18 @@ function openHandOutModal(kind, id){
     const alloc = resolveAllocation();
     if(!alloc) return false;
 
+    if(alloc.transferTo){
+      const to = alloc.transferTo, there = screwQtyAt(item, to);
+      if(!item.qtyByLocation) item.qtyByLocation = {};
+      item.qtyByLocation[location] = perPack ? roundP(here - qty) : roundQ(here - qty);
+      item.qtyByLocation[to] = perPack ? roundP(there + qty) : roundQ(there + qty);
+      dbRef('screwItems/' + id + '/qtyByLocation').set(item.qtyByLocation);
+      const qtyText = inLitres ? litresLabel(litres) : byEach ? eaQty + ' ea' : qty + ' ' + word;
+      sendTransferToDispatch(name, qtyText, inLitres ? roundQ(litres) : byEach ? eaQty : qty, location, to, inLitres ? 'litres' : byEach ? 'each' : word)
+        .then(() => toast('Moved ' + qtyText + ' of ' + name + ' to ' + to + ' — it\'s in Dispatch under Ready to dispatch.', 'ok'))
+        .catch(() => toast('Stock moved, but the Dispatch app couldn\'t be reached — add it there by hand.', 'err'));
+      return true;
+    }
     const finishPersonId = (personId)=>{
       if(!item.qtyByLocation) item.qtyByLocation = {};
       item.qtyByLocation[location] = perPack ? roundP(here - qty) : roundQ(here - qty);
@@ -1612,6 +1652,17 @@ function openUseLiquidModal(tid){
     const alloc = resolveAllocation();
     if(!alloc) return false;
 
+    if(alloc.transferTo){
+      const to = alloc.transferTo;
+      if(!type.volumeByLocation) type.volumeByLocation = {};
+      type.volumeByLocation[location] = here - ml;
+      type.volumeByLocation[to] = volumeAt(type, to) + ml;
+      dbRef('consumableTypes/' + tid + '/volumeByLocation').set(type.volumeByLocation);
+      sendTransferToDispatch(type.name, mlToLabel(ml), ml, location, to, 'ml')
+        .then(() => toast('Moved ' + mlToLabel(ml) + ' of ' + type.name + ' to ' + to + ' — it\'s in Dispatch under Ready to dispatch.', 'ok'))
+        .catch(() => toast('Stock moved, but the Dispatch app couldn\'t be reached — add it there by hand.', 'err'));
+      return true;
+    }
     const finishPersonId = (personId)=>{
       if(!type.volumeByLocation) type.volumeByLocation = {};
       type.volumeByLocation[location] = here - ml;
@@ -2680,6 +2731,108 @@ function closeModal(){
 if(CONFIG.EMAILJS_PUBLIC_KEY){ try{ emailjs.init(CONFIG.EMAILJS_PUBLIC_KEY); }catch(e){} }
 if ('serviceWorker' in navigator){ navigator.serviceWorker.register('sw.js').catch(()=>{}); }
 initFirebase();
+</script>
+<script>
+window.OAK_BACK_TABS = { get: function(){ return (typeof State !== "undefined" && State.currentUser) ? State.activeTab : null; }, set: function(t){ State.activeTab = t; render(); window.scrollTo(0,0); } };
+/* Oak Joinery — shared "← Back" button (2026-09-30, per Sean: "let's put back
+   buttons in all apps"). Adds a Back button next to every "☰ Menu" button and
+   makes the phone's own back button do the same thing. Back goes, in order:
+     1. out of an open pop-up (a delivery note opened from the list goes back
+        to the list),
+     2. to the previous screen in the app (Orders / Tools detail pages, or the
+        last tab you were on),
+     3. to the Oak Joinery menu.
+   Apps can tell it about their tabs with window.OAK_BACK_TABS = { get, set }. */
+(function(){
+  "use strict";
+  if (window.__oakBack) return; window.__oakBack = true;
+  var tabStack = [], lastTab = null, goingBack = false;
+
+  function visible(el){
+    if (!el || !el.isConnected) return false;
+    var cs = getComputedStyle(el);
+    if (cs.display === "none" || cs.visibility === "hidden") return false;
+    var r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+  var OVERLAYS = "#noteBg, #allBg, .modal-bg, .modal-overlay, .mbg, #modal-root .modal-backdrop, #modal-root > div";
+  function topOverlay(){
+    var list = Array.prototype.slice.call(document.querySelectorAll(OVERLAYS)).filter(visible)
+      .filter(function(el){ return el.id !== "loginOverlay" && !el.closest("#loginOverlay") && !/login/i.test(el.id || ""); });
+    return list.length ? list[list.length - 1] : null;
+  }
+  function closeButtonIn(el){
+    var b = el.querySelector(".note-back");
+    if (b && visible(b)) return b;
+    var btns = Array.prototype.slice.call(el.querySelectorAll("button")).filter(visible);
+    return btns.find(function(x){ return /(^|\s)(close-x|modal-close)(\s|$)/.test(x.className) || x.id === "mCancel" || x.id === "modal-cancel"; }) ||
+           btns.find(function(x){ return /^\s*(cancel|close|done|back|×|✕)\s*$/i.test(x.textContent); }) || null;
+  }
+  function goMenu(){
+    try { if (window.OakCore && OakCore.session && OakCore.session.get()) { OakCore.session.goHome(); return; } } catch (e) {}
+    location.href = "https://seanoakjoinery.github.io/oak-core/";
+  }
+  function back(){
+    var ov = topOverlay();
+    if (ov){
+      var b = closeButtonIn(ov);
+      if (b){ b.click(); return true; }
+      if (typeof window.closeModal === "function"){ window.closeModal(); return true; }
+      ov.remove(); return true;
+    }
+    var link = Array.prototype.slice.call(document.querySelectorAll(".backlink#back, #back.backlink")).filter(visible)[0];
+    if (link){ link.click(); return true; }
+    var T = window.OAK_BACK_TABS;
+    if (T && tabStack.length){
+      goingBack = true;
+      var t = tabStack.pop(); lastTab = t;
+      try { T.set(t); } finally { goingBack = false; }
+      return true;
+    }
+    goMenu(); return false;
+  }
+  window.oakBack = back;
+
+  // Remember the tab you came from.
+  function trackTab(){
+    var T = window.OAK_BACK_TABS; if (!T) return;
+    var cur; try { cur = T.get(); } catch (e) { return; }
+    if (cur === undefined || cur === null) return;
+    if (lastTab !== null && cur !== lastTab && !goingBack){ tabStack.push(lastTab); if (tabStack.length > 30) tabStack.shift(); }
+    lastTab = cur;
+  }
+
+  // Put a Back button in front of every Menu button (apps redraw, so keep checking).
+  function addButtons(){
+    var menus = Array.prototype.slice.call(document.querySelectorAll("button, a")).filter(function(x){
+      return /☰\s*Menu/.test(x.textContent || "") && !x.dataset.oakBackDone;
+    });
+    menus.forEach(function(m){
+      m.dataset.oakBackDone = "1";
+      var b = document.createElement(m.tagName === "A" ? "button" : m.tagName);
+      b.type = "button";
+      b.className = m.className;
+      b.setAttribute("style", (m.getAttribute("style") || "") + ";margin-right:6px");
+      b.textContent = "← Back";
+      b.title = "Back to the previous screen";
+      b.addEventListener("click", function(e){ e.preventDefault(); e.stopPropagation(); back(); });
+      m.parentNode.insertBefore(b, m);
+    });
+  }
+  function tick(){ addButtons(); trackTab(); }
+  new MutationObserver(tick).observe(document.documentElement, { childList:true, subtree:true });
+  document.addEventListener("click", function(){ setTimeout(trackTab, 0); }, true);
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", tick); else tick();
+
+  // The phone's own back button does the same as the Back button.
+  try {
+    history.pushState({ oakBack:1 }, "");
+    window.addEventListener("popstate", function(){
+      var stay = back();
+      if (stay) history.pushState({ oakBack:1 }, "");
+    });
+  } catch (e) {}
+})();
 </script>
 </body>
 </html>
