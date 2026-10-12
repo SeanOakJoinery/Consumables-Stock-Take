@@ -128,20 +128,24 @@
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-database-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-auth-compat.js"></script>
 <script>
-/* Oak Joinery — Firebase sign-in guard (2026-10-07).
-   The database is being locked so only signed-in apps can read or write it
-   (Firebase warned that anyone with the address could). Staff still only use
-   their PIN: every app signs in to Firebase anonymously in the background.
-   Every database call (on / once / set / update / push / remove / transaction)
-   waits until that app's sign-in has finished, so nothing is refused while
-   the sign-in is still happening. If anonymous sign-in isn't switched on yet,
-   or takes too long, the calls carry on as before — so this file is safe to
-   upload before the new database rules go in. */
+/* Oak Joinery — Firebase sign-in guard (v2, 2026-10-10: PIN lock).
+   Every app signs in to Firebase anonymously in the background, and every
+   database call (on / once / set / update / push / remove / transaction)
+   waits until that sign-in has finished.
+   PIN lock: once signed in, if someone is logged in on this device (the
+   shared Oak session: user id + PIN hash), this device is registered under
+   oakSessions/<its Firebase id>. The database rules only let a device read or
+   write when that registration matches the user's PIN in the locked pins/
+   store — so an outsider who only has the app's public key gets nothing.
+   If the registration is refused (PIN changed, user removed) the person is
+   sent back to the menu to log in again. If anonymous sign-in fails or takes
+   too long, the calls carry on as before. */
 (function(){
   "use strict";
   if (window.__oakAuthGuard || !window.firebase || !firebase.database) return;
-  window.__oakAuthGuard = true;
+  window.__oakAuthGuard = 2;
   var state = {};   // app name -> { ready, queue }
+  var set0 = null;  // the real Reference.set (before it is made to wait)
   function appOf(ref){
     try { return (ref && ref.database && ref.database.app) || firebase.app(); } catch (e) { return null; }
   }
@@ -155,13 +159,36 @@
     var q = s.queue; s.queue = [];
     q.forEach(function(f){ try { f(); } catch (e) { console.error(e); } });
   }
+  function localSession(){
+    try { var x = JSON.parse(localStorage.getItem("oakSession")); return x && x.id && x.pin && x.exp && Date.now() < x.exp ? x : null; } catch (e) { return null; }
+  }
+  function denied(e){ return /permission/i.test(String((e && (e.code || e.message)) || e)); }
+  function rejected(){
+    try { localStorage.removeItem("oakSession"); } catch (e) {}
+    try { window.dispatchEvent(new Event("oak-session-rejected")); } catch (e) {}
+    if (!/\/oak-core\/?(index\.html)?$/.test(location.pathname)) location.href = "/oak-core/?logout=1";
+  }
+  // Register this device's sign-in for the logged-in person, then let the queued calls go.
+  function register(app, u, s){
+    var x = localSession();
+    if (!x || !set0) { release(s); return; }
+    var done = false, t = setTimeout(function(){ if (!done) { done = true; release(s); } }, 8000);
+    var ref = firebase.database(app).ref("oakSessions/" + u.uid);
+    set0.call(ref, { user:String(x.id), pin:String(x.pin), ts:firebase.database.ServerValue.TIMESTAMP }).then(function(){
+      if (!done) { done = true; clearTimeout(t); release(s); }
+    }, function(e){
+      console.warn("Oak: this device's login was refused (" + ((e && e.code) || e) + ")");
+      if (!done) { done = true; clearTimeout(t); release(s); }
+      if (denied(e)) rejected();
+    });
+  }
   function signIn(app, s){
     if (!app || !firebase.auth) { release(s); return; }
     var a; try { a = firebase.auth(app); } catch (e) { release(s); return; }
     var timer = setTimeout(function(){ console.warn("Oak: Firebase sign-in is slow — carrying on"); release(s); }, 8000);
-    var asked = false;
+    var asked = false, seen = false;
     a.onAuthStateChanged(function(u){
-      if (u) { clearTimeout(timer); release(s); return; }
+      if (u) { if (seen) return; seen = true; clearTimeout(timer); register(app, u, s); return; }
       if (asked) return; asked = true;
       a.signInAnonymously().catch(function(e){ console.warn("Oak: anonymous sign-in not available (" + (e && e.code) + ")"); clearTimeout(timer); release(s); });
     });
@@ -173,6 +200,7 @@
   }
   var DB = firebase.database, Q = DB.Query && DB.Query.prototype, R = DB.Reference && DB.Reference.prototype;
   if (!Q || !R) return;
+  set0 = R.set;
   var on0 = Q.on, off0 = Q.off;
   Q.on = function(ev, cb){ var self = this, a = arguments; when(self, function(){ on0.apply(self, a); }); return cb; };
   Q.off = function(){ var self = this, a = arguments; when(self, function(){ off0.apply(self, a); }); };
@@ -188,7 +216,7 @@
 })();
 </script>
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-storage-compat.js"></script>
-<script src="https://seanoakjoinery.github.io/oak-core/oak-core.js?v=3"></script>
+<script src="https://seanoakjoinery.github.io/oak-core/oak-core.js?v=4"></script>
 <script>/* ONE LOGIN (oak-core v3): no session on this device -> log in on the Oak Joinery home app first. Add ?local=1 to the URL to use this app's own login screen instead. */
 (function(){try{var S=window.OakCore&&OakCore.session;if(S&&!S.get()&&!S.localLoginAllowed())S.goHome({next:'consumables'});}catch(e){}})();</script>
 <script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
@@ -541,7 +569,7 @@ async function attemptLogin(username, pin){
   const u = State.sharedUsers.find(x => x.username.toLowerCase() === username.trim().toLowerCase() && userHasApp(x));
   if(!u) return 'No user with that username has access to this app.';
   const enteredHash = await hashPin(pin.trim());
-  if(enteredHash !== u.pin) return 'Incorrect PIN.';
+  if(!(await OakCore.checkPinHash(u.id, enteredHash, u).catch(() => false))) return 'Incorrect PIN.';
   State.currentUser = u;
   sessionStorage.setItem(SESSION_KEY, JSON.stringify({id: u.id}));
   if(ssoOn()) OakCore.session.set(u);
@@ -2642,7 +2670,8 @@ function openAddUserModal(){
       manageUsers: false
     };
     const apps = readAppAccessChecklist('nu', iAmMainRoot, null);
-    State.sharedUsers.push({ id: uid(), username, pin: await hashPin(pin), consEmailSignature: signature, isRoot, permissions, apps });
+    const nid = uid(); await OakCore.setPin(nid, pin);
+    State.sharedUsers.push({ id: nid, username, consEmailSignature: signature, isRoot, permissions, apps });
     await saveSharedUsers();
     return true;
   });
@@ -2691,7 +2720,7 @@ function openEditUserModal(id){
       manageUsers: (u.permissions && u.permissions.manageUsers) || false
     };
     u.username = username;
-    if(pin) u.pin = await hashPin(pin);
+    if(pin){ await OakCore.setPin(u.id, pin); delete u.pin; }
     u.consEmailSignature = signature;
     // Merge, don't replace — replacing wiped this person's permissions in
     // the other three apps (Dispatch, Stock List, Board Stock).
@@ -2707,7 +2736,7 @@ function openEditUserModal(id){
       if(id === State.currentUser.id){ toast("You can't delete the account you're logged in as", 'err'); return; }
       if(u.isRoot && State.sharedUsers.filter(x=>x.isRoot).length <= 1){ toast("You can't delete the only root account — make another user root first", 'err'); return; }
       if(confirm('Remove user ' + u.username + '? They will no longer be able to log in to any app.')){
-        State.sharedUsers = State.sharedUsers.filter(x=>x.id!==id);
+        State.sharedUsers = State.sharedUsers.filter(x=>x.id!==id); if(window.OakCore && OakCore.removePin) OakCore.removePin(id);
         await saveSharedUsers();
         closeModal();
       }
