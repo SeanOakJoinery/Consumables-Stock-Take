@@ -482,6 +482,8 @@ function attachListeners(){
     onDataChange();
   });
   base.child('consumableTypes').on('value', snap => { State.consumableTypes = snap.val() || {}; onDataChange(); });
+  // Projects (2026-10-17): items bought for one job, and hand-outs recorded on a job's drawing / assembly
+  State.db.ref('projects/list').on('value', snap => { State.projects = snap.val() || {}; }, () => { State.projects = {}; });
   base.child('consumableUnits').on('value', snap => { State.consumableUnits = snap.val() || {}; onDataChange(); });
   base.child('people').on('value', snap => { State.people = snap.val() || {}; onDataChange(); });
   base.child('transactions').on('value', snap => { State.transactions = snap.val() || {}; onDataChange(); });
@@ -612,7 +614,10 @@ let reorderFlushTimer = null;
 // see dev notes) — this app no longer sends reorder emails itself the
 // instant something crosses its threshold. reorderSent is kept only as
 // harmless historical bookkeeping; nothing reads it anymore.
+// Bought for one job (Orders → "For: Job only"): kept under the job's name, never reordered (2026-10-17).
+function isJobItem(item){ return !!item && item.stockType === 'job'; }
 function checkReorder(kind, id, label, currentQty, reorderQty, currentlySent, supplierId, isVolume){
+  if(kind === 'screw' && isJobItem((State.screwItems || {})[id])) return;
   const belowThreshold = currentQty <= reorderQty;
   const path = kind === 'screw' ? 'screwItems' : 'consumableTypes';
   if(belowThreshold && !currentlySent){
@@ -674,7 +679,7 @@ function sendSupplierReorderEmail(supplierId, items){
 
 // Manual "send now" for a supplier, from the Suppliers tab — bypasses the queue/debounce.
 function sendReorderEmailNowForSupplier(supplierId){
-  const lowScrews = Object.values(State.screwItems||{}).filter(i=> stockAmount(i) <= i.reorderQty && (i.supplierId||'__none') === supplierId)
+  const lowScrews = Object.values(State.screwItems||{}).filter(i=> !isJobItem(i) && stockAmount(i) <= i.reorderQty && (i.supplierId||'__none') === supplierId)
     .map(i=>({ itemLabel: itemName(i) + ' (' + unitWord(i) + ')', currentQty: stockTotalLabel(i), reorderQty: i.reorderQty }));
   const lowCons = Object.entries(State.consumableTypes||{}).filter(([tid,t])=>
     isConsumableTypeLow(tid, t) && (t.supplierId||'__none') === supplierId
@@ -973,17 +978,19 @@ function renderCountedCard(tabKey){
     const tbody = document.createElement('tbody');
     // Grouped by category, in the order of ITEM_CATEGORIES.
     const catOrder = c => { const i = ITEM_CATEGORIES.indexOf(c); return i < 0 ? 999 : i; };
-    items.sort((a, b) => (catOrder(itemCategory(a[1])) - catOrder(itemCategory(b[1]))) || itemName(a[1]).localeCompare(itemName(b[1]), undefined, { numeric: true }));
+    const jobKey = it => isJobItem(it) ? 'For job: ' + (it.job || '—') : '';
+    items.sort((a, b) => (jobKey(a[1]) ? 1 : 0) - (jobKey(b[1]) ? 1 : 0) || jobKey(a[1]).localeCompare(jobKey(b[1])) || (catOrder(itemCategory(a[1])) - catOrder(itemCategory(b[1]))) || itemName(a[1]).localeCompare(itemName(b[1]), undefined, { numeric: true }));
     let lastCat = null;
     items.forEach(([id, item]) => {
-      const cat = itemCategory(item);
-      if(!onLiquidTab && cat !== lastCat){
+      const isJob = isJobItem(item), cat = isJob ? jobKey(item) : itemCategory(item);
+      if(isJob && stockAmount(item) <= 0) return;   // used up — nothing left to show
+      if((!onLiquidTab || isJob) && cat !== lastCat){
         const hr = document.createElement('tr');
-        hr.innerHTML = `<td colspan="8" style="font-weight:700;padding-top:14px;color:var(--amber, #d59a3a);">${escapeHtml(cat)}</td>`;
+        hr.innerHTML = `<td colspan="8" style="font-weight:700;padding-top:14px;color:${isJob ? '#7FB3E0' : 'var(--amber, #d59a3a)'};">${isJob ? '📌 ' : ''}${escapeHtml(cat)}${isJob ? ' <span class="sub" style="font-weight:400">— bought for this job only, not reordered</span>' : ''}</td>`;
         tbody.appendChild(hr);
         lastCat = cat;
       }
-      const low = stockAmount(item) <= item.reorderQty;
+      const low = !isJob && stockAmount(item) <= item.reorderQty;
       const supplierName = item.supplierId && State.suppliers[item.supplierId] ? State.suppliers[item.supplierId].name : '—';
       const breakdown = locations.map(l => `${escapeHtml(l)}: ${stockAtLabel(item, l)}`).join(', ');
       const tr = document.createElement('tr');
@@ -993,9 +1000,9 @@ function renderCountedCard(tabKey){
         <td>${escapeHtml(unitLabel(item))}</td>
         <td class="num">${escapeHtml(stockTotalLabel(item))}</td>
         <td class="sub" style="font-size:12px;">${breakdown}</td>
-        <td class="num">${itemUnit(item) === 'tin' && tinLitres(item) ? litresLabel((item.reorderQty || 0) * tinLitres(item)) : item.reorderQty}</td>
+        <td class="num">${isJob ? '—' : itemUnit(item) === 'tin' && tinLitres(item) ? litresLabel((item.reorderQty || 0) * tinLitres(item)) : item.reorderQty}</td>
         <td>${escapeHtml(supplierName)}</td>
-        <td>${low ? '<span class="pill low">Reorder</span>' : '<span class="pill ok">OK</span>'}</td>
+        <td>${isJob ? '<span class="pill" style="background:rgba(127,179,224,.15);color:#7FB3E0">For job</span>' : low ? '<span class="pill low">Reorder</span>' : '<span class="pill ok">OK</span>'}</td>
         <td></td>
       `;
       const actionsTd = tr.lastElementChild;
@@ -1340,6 +1347,27 @@ function openRestockModal(kind, id){
 // it went: a team member (the shared login list), another named person,
 // a site/job, or Head office. Each destination is also a People entry
 // so the People tab and Excel export keep grouping by recipient.
+/* ---- record a hand-out on a job (2026-10-17) ---- */
+function jobLabel(id){ const p = (State.projects || {})[id]; return p ? (p.jobNo ? p.jobNo + ' · ' : '') + (p.name || '') : ''; }
+function jobPickHtml(item){
+  const pre = isJobItem(item) && item.projectId ? item.projectId : '';
+  const js = Object.keys(State.projects || {}).filter(k => State.projects[k] && (State.projects[k].status !== 'complete' || k === pre))
+    .sort((a,b) => String(State.projects[b].jobNo||'').localeCompare(String(State.projects[a].jobNo||''), undefined, { numeric:true }));
+  if(!js.length) return '';
+  setTimeout(() => { const s = document.getElementById('m-job'); if(s){ s.onchange = jobPickChanged; if(pre) jobPickChanged(); } }, 0);
+  return `<label>Used on a job (optional)</label><select id="m-job"><option value="">— not for a job —</option>${js.map(k => `<option value="${escapeHtml(k)}" ${k===pre?'selected':''}>${escapeHtml(jobLabel(k))}</option>`).join('')}</select><div id="m-jobmore"></div>`;
+}
+function jobPickChanged(){
+  const pid = document.getElementById('m-job').value, w = document.getElementById('m-jobmore'), p = pid ? State.projects[pid] : null;
+  if(!p){ w.innerHTML = ''; return; }
+  const ds = Object.keys(p.drawings || {}).map(id => Object.assign({ id }, p.drawings[id])).sort((a,b) => String(a.no||'').localeCompare(String(b.no||''), undefined, { numeric:true }));
+  w.innerHTML = ds.length ? `<div class="row2"><div><label>Drawing</label><select id="m-dwg"><option value="">— whole job —</option>${ds.map(d => `<option value="${escapeHtml(d.id)}">${escapeHtml((d.no ? d.no + ' — ' : '') + (d.title || ''))}</option>`).join('')}</select></div><div id="m-asmwrap"></div></div>` : '';
+  const dw = document.getElementById('m-dwg'); if(!dw) return;
+  dw.onchange = () => { const d = p.drawings[dw.value], as = d ? Object.keys(d.assemblies || {}).map(id => Object.assign({ id }, d.assemblies[id])).sort((a,b) => (Number(a.n)||0) - (Number(b.n)||0)) : [];
+    document.getElementById('m-asmwrap').innerHTML = as.length ? `<label>Assembly</label><select id="m-asm"><option value="">— whole drawing —</option>${as.map(a => `<option value="${escapeHtml(a.id)}">${escapeHtml(a.name)}</option>`).join('')}</select>` : ''; };
+}
+function readJobPick(){ const j = document.getElementById('m-job'); if(!j || !j.value) return null;
+  return { pid:j.value, dwg:(document.getElementById('m-dwg') || {}).value || '', asm:(document.getElementById('m-asm') || {}).value || '' }; }
 function allocationSelectHtml(){
   const users = (State.sharedUsers || []).filter(u => u && u.username).map(u => u.username)
     .sort((a, b) => a.localeCompare(b));
@@ -1448,6 +1476,7 @@ function openHandOutModal(kind, id){
     ${item.photoUrl ? `<img src="${item.photoUrl}" alt="" style="max-width:100%;max-height:160px;border-radius:8px;margin-bottom:8px;">` : ''}
     ${allocationSelectHtml()}
     ${locationSelectHtml('m-loc', null)}
+    ${jobPickHtml(item)}
     <div class="row2">
       <div><label>Qty</label><div style="display:flex;gap:6px"><input type="number" id="m-qty" value="${byLitre ? (perTin >= 1 ? '1' : '250') : '1'}" min="0" step="any" style="flex:1">
         ${byLitre ? `<select id="m-qunit" style="width:auto"><option value="l" ${perTin >= 1 ? 'selected' : ''}>L</option><option value="ml" ${perTin < 1 ? 'selected' : ''}>ml</option></select>`
@@ -1483,6 +1512,7 @@ function openHandOutModal(kind, id){
         .catch(() => toast('Stock moved, but the Dispatch app couldn\'t be reached — add it there by hand.', 'err'));
       return true;
     }
+    const job = readJobPick();
     const finishPersonId = (personId)=>{
       if(!item.qtyByLocation) item.qtyByLocation = {};
       item.qtyByLocation[location] = perPack ? roundP(here - qty) : roundQ(here - qty);
@@ -1492,7 +1522,13 @@ function openHandOutModal(kind, id){
         personId, itemType:'screw', itemId:id, itemLabel: name, unit: inLitres ? 'litres' : byEach ? 'each' : itemUnit(item), category: itemCategory(item), qty: inLitres ? roundQ(litres) : byEach ? eaQty : qty, ...(byEach ? { byEach: true } : {}), date, month: monthKey(date),
         recipientType: alloc.recipientType, recipientName: alloc.recipientName, handedOutBy: currentUsername(), location
       });
-      toast('Handed out ' + (inLitres ? litresLabel(litres) : byEach ? eaQty + ' ea' : qty + ' ' + word) + ' of ' + name + ' → ' + alloc.recipientName, 'ok');
+      toast('Handed out ' + (inLitres ? litresLabel(litres) : byEach ? eaQty + ' ea' : qty + ' ' + word) + ' of ' + name + ' → ' + alloc.recipientName + (job ? ' · recorded on ' + jobLabel(job.pid) : ''), 'ok');
+      if(job){
+        const shown = inLitres ? litresLabel(litres) : byEach ? eaQty + ' ea' : '';
+        State.db.ref('projects/materials/' + job.pid + '/' + uid()).set({ ts:new Date().toISOString(), by:currentUsername(), type:'cons', qty, unit: perTin ? 'tins' : word, item:name, location,
+          stock:{ app:'cons', id:'s:' + id, location }, drawingId:job.dwg, asmId:job.asm, note:['handed out to ' + alloc.recipientName, shown ? '(' + shown + ')' : '', isJobItem(item) ? 'bought for this job' : ''].filter(Boolean).join(' · ') })
+          .catch(() => toast('Handed out, but it could not be recorded on the job — add it in Projects → Materials.', 'err'));
+      }
     };
     finishPersonId(alloc.personId);
     return true;
